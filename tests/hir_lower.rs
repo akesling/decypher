@@ -6,7 +6,7 @@
 use assert2::check;
 use decypher::analyze;
 use decypher::hir::{
-    ExprKind, RelationshipDirection,
+    ExprKind, LowerConfig, RelationshipDirection,
     expr::{BinaryOp, Literal as HirLiteral},
     ops::ProjectOp,
     ops::{AggregateOp, MatchOp, Operation},
@@ -345,12 +345,15 @@ fn analyze_return_preserves_qualified_function_name() {
 
 /// `WITH apoc.coll.count(…) AS c` preserves the qualified name through the aggregate interning path.
 ///
-/// Unit: `analyze()` → `lower_with` aggregate arm → `FunctionId` interning
-/// Precondition: Namespaced function whose last segment is a known aggregate name.
+/// Unit: `lower()` with custom registry → `lower_with` aggregate arm → `FunctionId` interning
+/// Precondition: Qualified function registered as a custom aggregate via `LowerConfig`.
 /// Expectation: `arenas.functions.name_of(aggregate.function)` returns the full dotted name.
 #[test]
 fn analyze_with_aggregate_preserves_qualified_function_name() {
-    let hir = analyze("MATCH (n) WITH apoc.coll.count(n.name) AS c RETURN c").unwrap();
+    let mut config = LowerConfig::default();
+    config.aggregates.register("apoc.coll.count");
+    let query = decypher::parse("MATCH (n) WITH apoc.coll.count(n.name) AS c RETURN c").unwrap();
+    let hir = decypher::hir::lower::lower(&query, &config).unwrap();
 
     let function_id = hir.parts[0]
         .operations
@@ -372,12 +375,15 @@ fn analyze_with_aggregate_preserves_qualified_function_name() {
 
 /// `RETURN apoc.coll.count(…) AS c` preserves the qualified name through the RETURN aggregate path.
 ///
-/// Unit: `analyze()` → `lower_return` aggregate arm → `FunctionId` interning
-/// Precondition: Namespaced function whose last segment is a known aggregate name, in RETURN.
+/// Unit: `lower()` with custom registry → `lower_return` aggregate arm → `FunctionId` interning
+/// Precondition: Qualified function registered as a custom aggregate via `LowerConfig`.
 /// Expectation: `arenas.functions.name_of(aggregate.function)` returns the full dotted name.
 #[test]
 fn analyze_return_aggregate_preserves_qualified_function_name() {
-    let hir = analyze("MATCH (n) RETURN apoc.coll.count(n.name) AS c").unwrap();
+    let mut config = LowerConfig::default();
+    config.aggregates.register("apoc.coll.count");
+    let query = decypher::parse("MATCH (n) RETURN apoc.coll.count(n.name) AS c").unwrap();
+    let hir = decypher::hir::lower::lower(&query, &config).unwrap();
 
     let function_id = hir.parts[0]
         .operations
