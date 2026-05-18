@@ -7,7 +7,7 @@ use assert2::check;
 use decypher::analyze;
 use decypher::hir::{
     ExprKind, RelationshipDirection,
-    expr::Literal as HirLiteral,
+    expr::{BinaryOp, Literal as HirLiteral},
     ops::ProjectOp,
     ops::{AggregateOp, MatchOp, Operation},
 };
@@ -23,6 +23,24 @@ fn find_match_operation(operations: &[Operation]) -> &MatchOp {
             }
         })
         .expect("expected a Match operation")
+}
+
+fn find_first_project_expression(hir: &decypher::hir::HirQuery) -> &ExprKind {
+    let part = hir.parts.first().expect("expected at least one query part");
+    let project = part
+        .operations
+        .iter()
+        .find_map(|op| match op {
+            Operation::Project(project) => Some(project),
+            _ => None,
+        })
+        .expect("expected a Project operation");
+    let expression_id = project
+        .items
+        .first()
+        .expect("expected at least one projection item")
+        .expression;
+    &hir.arenas.expressions.get(expression_id).kind
 }
 
 fn find_project_operation(operations: &[Operation]) -> &ProjectOp {
@@ -377,4 +395,94 @@ fn analyze_return_aggregate_preserves_qualified_function_name() {
         hir.arenas.functions.name_of(function_id),
         Some("apoc.coll.count"),
     );
+}
+
+#[test]
+fn function_call_single_binary_argument_lowers_as_single_arg() {
+    let hir = analyze("RETURN round(1 + 2) AS r").unwrap();
+    let expr_kind = find_first_project_expression(&hir);
+
+    let args = match expr_kind {
+        ExprKind::FunctionCall { args, .. } => args,
+        other => panic!("expected FunctionCall, got {other:?}"),
+    };
+
+    assert_eq!(args.len(), 1, "expected exactly one function argument");
+    let arg_expr = &hir.arenas.expressions.get(args[0]).kind;
+    match arg_expr {
+        ExprKind::Binary { op, .. } => assert_eq!(*op, BinaryOp::Add),
+        other => panic!("expected binary addition argument, got {other:?}"),
+    }
+}
+
+#[test]
+fn function_call_chained_binary_argument_lowers_as_single_arg() {
+    let hir = analyze("RETURN round(3.0 * 4.0 / 5.0) AS r").unwrap();
+    let expr_kind = find_first_project_expression(&hir);
+
+    let args = match expr_kind {
+        ExprKind::FunctionCall { args, .. } => args,
+        other => panic!("expected FunctionCall, got {other:?}"),
+    };
+
+    assert_eq!(args.len(), 1, "expected exactly one function argument");
+    let arg_expr = &hir.arenas.expressions.get(args[0]).kind;
+    match arg_expr {
+        ExprKind::Binary { op, .. } => assert_eq!(*op, BinaryOp::Divide),
+        other => panic!("expected binary division argument, got {other:?}"),
+    }
+}
+
+#[test]
+fn function_call_mixed_precedence_argument_lowers_as_single_arg() {
+    // 1 + 2 * 3 must lower as Add(1, Mul(2, 3)), not a flat chain
+    let hir = analyze("RETURN round(1 + 2 * 3) AS r").unwrap();
+    let expr_kind = find_first_project_expression(&hir);
+
+    let args = match expr_kind {
+        ExprKind::FunctionCall { args, .. } => args,
+        other => panic!("expected FunctionCall, got {other:?}"),
+    };
+
+    assert_eq!(args.len(), 1, "expected exactly one function argument");
+
+    let (add_left, add_right) = match &hir.arenas.expressions.get(args[0]).kind {
+        ExprKind::Binary { op, left, right } => {
+            assert_eq!(*op, BinaryOp::Add);
+            (*left, *right)
+        }
+        other => panic!("expected top-level Add, got {other:?}"),
+    };
+
+    match &hir.arenas.expressions.get(add_left).kind {
+        ExprKind::Literal(_) => {}
+        other => panic!("expected literal 1 as left operand of Add, got {other:?}"),
+    }
+
+    match &hir.arenas.expressions.get(add_right).kind {
+        ExprKind::Binary { op, .. } => assert_eq!(*op, BinaryOp::Multiply),
+        other => panic!("expected Multiply as right operand of Add, got {other:?}"),
+    }
+}
+
+#[test]
+fn function_call_two_binary_arguments_each_lowers_as_one_arg() {
+    let hir = analyze("RETURN round(3.0 * 4.0, 1 + 2) AS r").unwrap();
+    let expr_kind = find_first_project_expression(&hir);
+
+    let args = match expr_kind {
+        ExprKind::FunctionCall { args, .. } => args,
+        other => panic!("expected FunctionCall, got {other:?}"),
+    };
+
+    assert_eq!(args.len(), 2, "expected exactly two function arguments");
+
+    match &hir.arenas.expressions.get(args[0]).kind {
+        ExprKind::Binary { op, .. } => assert_eq!(*op, BinaryOp::Multiply),
+        other => panic!("expected binary multiply for arg 0, got {other:?}"),
+    }
+    match &hir.arenas.expressions.get(args[1]).kind {
+        ExprKind::Binary { op, .. } => assert_eq!(*op, BinaryOp::Add),
+        other => panic!("expected binary add for arg 1, got {other:?}"),
+    }
 }
