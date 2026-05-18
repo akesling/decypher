@@ -15,8 +15,8 @@ use crate::ast::clause::{
     SetItem, SetOperator, Unwind, With,
 };
 use crate::ast::expr::{
-    BinaryOperator, ComparisonOperator, ExistsInner, Expression, Literal, MapProjectionItem,
-    NumberLiteral, UnaryOperator,
+    BinaryOperator, ComparisonOperator, ExistsInner, Expression, FunctionInvocation, Literal,
+    MapProjectionItem, NumberLiteral, UnaryOperator,
 };
 use crate::ast::names::Variable;
 use crate::ast::pattern::{
@@ -680,7 +680,7 @@ impl LoweringContext {
                 if self.has_aggregate(&pi.expression) {
                     let (func_id, args, distinct) = match &pi.expression {
                         Expression::FunctionCall(fc) => {
-                            let name = fc.name.last().map(|s| s.name.clone()).unwrap_or_default();
+                            let name = Self::qualified_function_name(fc);
                             let fid = self.arenas.functions.intern(&name, Id);
                             let a = fc.arguments.iter().map(|a| self.lower_expr(a)).collect();
                             (fid, a, fc.distinct)
@@ -840,8 +840,7 @@ impl LoweringContext {
                     if self.has_aggregate(&pi.expression) {
                         let (func_id, args, distinct) = match &pi.expression {
                             Expression::FunctionCall(fc) => {
-                                let name =
-                                    fc.name.last().map(|s| s.name.clone()).unwrap_or_default();
+                                let name = Self::qualified_function_name(fc);
                                 let fid = self.arenas.functions.intern(&name, Id);
                                 let a = fc.arguments.iter().map(|a| self.lower_expr(a)).collect();
                                 (fid, a, fc.distinct)
@@ -1106,7 +1105,7 @@ impl LoweringContext {
                 }
             }
             Expression::FunctionCall(fc) => {
-                let name = fc.name.last().map(|s| s.name.clone()).unwrap_or_default();
+                let name = Self::qualified_function_name(fc);
                 let func_id = self.arenas.functions.intern(&name, Id);
                 let args = fc.arguments.iter().map(|a| self.lower_expr(a)).collect();
                 ExprKind::FunctionCall {
@@ -1680,6 +1679,17 @@ impl LoweringContext {
         self.resolve_or_bind_variable(var)
     }
 
+    fn qualified_function_name(fc: &FunctionInvocation) -> String {
+        let mut name = String::new();
+        for (idx, segment) in fc.name.iter().enumerate() {
+            if idx > 0 {
+                name.push('.');
+            }
+            name.push_str(&segment.name);
+        }
+        name
+    }
+
     fn infer_alias_name(&self, expr: &Expression) -> String {
         match expr {
             Expression::Variable(v) => v.name.name.clone(),
@@ -1899,5 +1909,59 @@ mod tests {
         assert!(matches!(&ops[2], Operation::Sort(_)));
         assert!(matches!(&ops[3], Operation::Limit(_)));
         assert!(matches!(&ops[4], Operation::Return(_)));
+    }
+
+    #[test]
+    fn test_function_call_preserves_qualified_name() {
+        let query = parse("RETURN apoc.text.distance('hello', 'world') AS d").unwrap();
+        let hir = lower(&query).unwrap();
+        let ops = &hir.parts[0].operations;
+
+        let function = match &ops[0] {
+            Operation::Project(ProjectOp { items, .. }) => {
+                match &hir.arenas.expressions.get(items[0].expression).kind {
+                    ExprKind::FunctionCall { function, .. } => *function,
+                    _ => panic!("Expected function call expression"),
+                }
+            }
+            _ => panic!("Expected ProjectOp"),
+        };
+
+        assert_eq!(
+            hir.arenas.functions.name_of(function),
+            Some("apoc.text.distance")
+        );
+    }
+
+    #[test]
+    fn test_qualified_function_name_does_not_collide_with_builtin() {
+        let query = parse(
+            "RETURN replace('hello', 'l', 'x') AS a, apoc.text.replace('hello', 'l', 'x') AS b",
+        )
+        .unwrap();
+        let hir = lower(&query).unwrap();
+        let ops = &hir.parts[0].operations;
+
+        let (builtin, qualified) = match &ops[0] {
+            Operation::Project(ProjectOp { items, .. }) => {
+                let builtin = match &hir.arenas.expressions.get(items[0].expression).kind {
+                    ExprKind::FunctionCall { function, .. } => *function,
+                    _ => panic!("Expected first expression to be a function call"),
+                };
+                let qualified = match &hir.arenas.expressions.get(items[1].expression).kind {
+                    ExprKind::FunctionCall { function, .. } => *function,
+                    _ => panic!("Expected second expression to be a function call"),
+                };
+                (builtin, qualified)
+            }
+            _ => panic!("Expected ProjectOp"),
+        };
+
+        assert_ne!(builtin, qualified);
+        assert_eq!(hir.arenas.functions.name_of(builtin), Some("replace"));
+        assert_eq!(
+            hir.arenas.functions.name_of(qualified),
+            Some("apoc.text.replace")
+        );
     }
 }
