@@ -671,3 +671,70 @@ fn rt_comparison_le() {
 fn rt_comparison_ge() {
     roundtrip("MATCH (n) WHERE n.age >= 18 RETURN n;");
 }
+
+// ── Query-time variable substitution ─────────────────────────────────────────
+
+/// Round-trip `SET n[$key] = $value`: dynamic property key survives re-serialisation.
+///
+/// Unit: `ToCypher::to_cypher` / `parse`
+/// Precondition: SET clause uses a parameter as a dynamic property key.
+/// Expectation: Re-parsed AST equals the original parsed AST.
+#[test]
+fn rt_set_dynamic_property_key() {
+    roundtrip("MATCH (n) SET n[$key] = $value RETURN n;");
+}
+
+/// Round-trip `CREATE (p:Person {name: $name})`: parameter value survives re-serialisation.
+///
+/// Unit: `ToCypher::to_cypher` / `parse`
+/// Precondition: CREATE uses a parameter as a map property value.
+/// Expectation: Re-parsed AST equals the original parsed AST.
+#[test]
+fn rt_create_with_parameter_value() {
+    roundtrip("CREATE (p:Person {name: $name}) RETURN p;");
+}
+
+/// Round-trip MERGE with ON CREATE / ON MATCH parameter values.
+///
+/// Unit: `ToCypher::to_cypher` / `parse`
+/// Precondition: MERGE with ON CREATE and ON MATCH SET actions using parameters.
+/// Expectation: Re-parsed AST equals the original parsed AST.
+#[test]
+fn rt_merge_with_parameter_values() {
+    roundtrip(
+        "MERGE (p:Person {externalId: $externalId}) \
+         ON CREATE SET p.name = $name \
+         ON MATCH SET p.lastSeenAt = datetime() \
+         RETURN p;",
+    );
+}
+
+/// Round-trip `SET n.props[$key] = $value`: chained property lookup with dynamic key.
+///
+/// Unit: `ToCypher::to_cypher` / `parse`
+/// Precondition: SET clause chains a static property lookup with a dynamic key.
+/// Expectation: Re-parsed AST equals the original parsed AST.
+#[test]
+fn rt_set_dynamic_property_key_after_lookup() {
+    roundtrip("MATCH (n) SET n.props[$key] = $value RETURN n;");
+}
+
+/// Round-trip `SET n[$k1] = $v1, n[$k2] = $v2`: multiple dynamic property assignments.
+///
+/// Unit: `ToCypher::to_cypher` / `parse`
+/// Precondition: SET clause contains two dynamic-key items.
+/// Expectation: Re-parsed AST equals the original parsed AST.
+#[test]
+fn rt_set_multiple_dynamic_property_keys() {
+    roundtrip("MATCH (n) SET n[$k1] = $v1, n[$k2] = $v2 RETURN n;");
+}
+
+/// Round-trip `SET n["propName"] = $v`: string literal as the dynamic key.
+///
+/// Unit: `ToCypher::to_cypher` / `parse`
+/// Precondition: SET clause uses a string literal as the property key expression.
+/// Expectation: Re-parsed AST equals the original parsed AST.
+#[test]
+fn rt_set_dynamic_property_literal_key() {
+    roundtrip("MATCH (n) SET n[\"propName\"] = $v RETURN n;");
+}
