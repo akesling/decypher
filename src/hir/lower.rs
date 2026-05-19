@@ -683,8 +683,12 @@ impl<'cfg> LoweringContext<'cfg> {
                 if self.has_aggregate(&pi.expression) {
                     let (func_id, args, distinct) = match &pi.expression {
                         Expression::FunctionCall(fc) => {
-                            let name = Self::qualified_function_name(fc);
-                            let fid = self.arenas.functions.intern(&name, Id);
+                            let key = Self::qualified_function_key(fc);
+                            let display = Self::qualified_function_name(fc);
+                            let fid = self
+                                .arenas
+                                .functions
+                                .intern_with_display(&key, &display, Id);
                             let a = fc.arguments.iter().map(|a| self.lower_expr(a)).collect();
                             (fid, a, fc.distinct)
                         }
@@ -843,8 +847,12 @@ impl<'cfg> LoweringContext<'cfg> {
                     if self.has_aggregate(&pi.expression) {
                         let (func_id, args, distinct) = match &pi.expression {
                             Expression::FunctionCall(fc) => {
-                                let name = Self::qualified_function_name(fc);
-                                let fid = self.arenas.functions.intern(&name, Id);
+                                let key = Self::qualified_function_key(fc);
+                                let display = Self::qualified_function_name(fc);
+                                let fid = self
+                                    .arenas
+                                    .functions
+                                    .intern_with_display(&key, &display, Id);
                                 let a = fc.arguments.iter().map(|a| self.lower_expr(a)).collect();
                                 (fid, a, fc.distinct)
                             }
@@ -959,14 +967,24 @@ impl<'cfg> LoweringContext<'cfg> {
     }
 
     fn lower_procedure_invocation(&mut self, proc: &ProcedureInvocation) -> CallProcedureOp {
-        let name = proc
+        let key = proc
             .name
             .name
             .iter()
-            .map(|s| s.name.clone())
+            .map(|s| s.name.replace('\x00', "\x00\x00"))
+            .collect::<Vec<_>>()
+            .join("\x00");
+        let display = proc
+            .name
+            .name
+            .iter()
+            .map(|s| s.name.as_str())
             .collect::<Vec<_>>()
             .join(".");
-        let procedure = self.arenas.functions.intern(&name, Id);
+        let procedure = self
+            .arenas
+            .functions
+            .intern_with_display(&key, &display, Id);
         let args = proc
             .name
             .arguments
@@ -1108,8 +1126,12 @@ impl<'cfg> LoweringContext<'cfg> {
                 }
             }
             Expression::FunctionCall(fc) => {
-                let name = Self::qualified_function_name(fc);
-                let func_id = self.arenas.functions.intern(&name, Id);
+                let key = Self::qualified_function_key(fc);
+                let display = Self::qualified_function_name(fc);
+                let func_id = self
+                    .arenas
+                    .functions
+                    .intern_with_display(&key, &display, Id);
                 let args = fc.arguments.iter().map(|a| self.lower_expr(a)).collect();
                 ExprKind::FunctionCall {
                     function: func_id,
@@ -1693,6 +1715,14 @@ impl<'cfg> LoweringContext<'cfg> {
         name
     }
 
+    fn qualified_function_key(fc: &FunctionInvocation) -> String {
+        fc.name
+            .iter()
+            .map(|s| s.name.replace('\x00', "\x00\x00"))
+            .collect::<Vec<_>>()
+            .join("\x00")
+    }
+
     fn infer_alias_name(&self, expr: &Expression) -> String {
         match expr {
             Expression::Variable(v) => v.name.name.clone(),
@@ -1998,6 +2028,37 @@ mod tests {
             matches!(&ops[1], Operation::Aggregate(_)),
             "expected AggregateOp but got: {:?}",
             &ops[1]
+        );
+    }
+
+    #[test]
+    fn test_escaped_segment_does_not_collide_with_dotted_namespace() {
+        // `apoc.text`.distance has 2 segments: ["apoc.text", "distance"]
+        // apoc.text.distance has 3 segments: ["apoc", "text", "distance"]
+        // They must produce distinct FunctionIds.
+        let query =
+            parse("RETURN `apoc.text`.distance('a', 'b'), apoc.text.distance('a', 'b')").unwrap();
+        let hir = lower(&query, &LowerConfig::default()).unwrap();
+        let ops = &hir.parts[0].operations;
+
+        let (escaped_id, plain_id) = match &ops[0] {
+            Operation::Project(ProjectOp { items, .. }) => {
+                let escaped = match &hir.arenas.expressions.get(items[0].expression).kind {
+                    ExprKind::FunctionCall { function, .. } => *function,
+                    _ => panic!("Expected FunctionCall for item 0"),
+                };
+                let plain = match &hir.arenas.expressions.get(items[1].expression).kind {
+                    ExprKind::FunctionCall { function, .. } => *function,
+                    _ => panic!("Expected FunctionCall for item 1"),
+                };
+                (escaped, plain)
+            }
+            _ => panic!("Expected ProjectOp"),
+        };
+
+        assert_ne!(
+            escaped_id, plain_id,
+            "`apoc.text`.distance and apoc.text.distance must have distinct FunctionIds"
         );
     }
 }
