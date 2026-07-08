@@ -651,3 +651,29 @@ fn test_function_call_in_expression_argument_not_split() {
         other => panic!("expected a FunctionCall, got {other:?}"),
     }
 }
+
+/// A bare-identifier collection (`x IN coll`, as opposed to a list literal or
+/// property lookup) must still parse. `IdInColl::collection()` used to
+/// exclude *every* `VARIABLE`-kind child to skip the binder, which also threw
+/// away a same-kind bare-identifier collection, leaving no Expression-castable
+/// child at all — surfaced as an "missing collection in list comp" internal
+/// parse error.
+///
+/// Unit: `parse()` / AST `Expression::ListComprehension`
+/// Precondition: `RETURN [x IN coll | x*2];`.
+/// Expectation: `parse()` succeeds and `collection` is `Variable("coll")`.
+#[test]
+fn test_list_comprehension_bare_identifier_collection() {
+    use decypher::ast::expr::Expression;
+
+    let query = parse("RETURN [x IN coll | x*2];").unwrap();
+    match first_projection_expr(&query) {
+        Expression::ListComprehension(lc) => match lc.collection.as_ref() {
+            Expression::Variable(v) => {
+                check!(v.name.name == "coll");
+            }
+            other => panic!("expected Variable collection, got {other:?}"),
+        },
+        other => panic!("expected a ListComprehension, got {other:?}"),
+    }
+}

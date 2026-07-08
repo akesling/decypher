@@ -1321,13 +1321,22 @@ impl IdInColl {
     }
 
     pub fn collection(&self) -> Option<Expression> {
-        // The loop `VARIABLE` is a genuine sibling to exclude here, but the
-        // collection expression itself may be a compound expression
+        // The loop `VARIABLE` (always the *first* child, emitted before `IN`)
+        // is a genuine sibling to exclude here, but filtering it out *by
+        // kind* — as opposed to by position — is wrong: a bare-identifier
+        // collection (`x IN coll`) is *also* a `VARIABLE` node, and a
+        // kind-based filter would exclude that one too, leaving no
+        // Expression-castable child at all (previously surfaced upstream as
+        // an "missing collection in list comp" internal error, worked around
+        // by callers parenthesizing bare-identifier collections before
+        // parsing). Skip exactly the first child instead.
+        //
+        // The collection expression itself may be a compound expression
         // (`x IN a.list + b.list`), so the last remaining Expression-castable
         // child — not the first — is the fully composed collection.
         self.0
             .children()
-            .filter(|n| n.kind() != SyntaxKind::VARIABLE && n.kind() != SyntaxKind::SYMBOLIC_NAME)
+            .skip(1)
             .filter_map(Expression::cast)
             .last()
     }
