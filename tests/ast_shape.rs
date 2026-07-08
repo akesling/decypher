@@ -242,3 +242,191 @@ fn test_range_is_still_a_valid_variable_name() {
     let result = parse("WITH 1 AS range RETURN range;");
     check!(result.is_ok(), "{:?}", result.err());
 }
+
+// ============================================================
+// Compound-expression truncation regressions
+//
+// The CST for a compound expression like `1 + 1` stores the operator node
+// (`ADD_SUB_EXPR`) as a *sibling* of its LHS, not a wrapper around it (the
+// LHS is recovered via `prev_sibling()`). Several typed-CST accessors that
+// pick "an" Expression out of a run of such siblings previously grabbed the
+// *first* castable node (the LHS atom) instead of the *last* (the fully
+// composed expression), truncating every compound expression down to its
+// leading atom wherever they were used: list-literal elements, map-literal
+// values, the UNWIND source expression, and (via an unrelated but
+// same-shaped bug) FunctionInvocation arguments dropping a bare-variable
+// first argument entirely.
+// ============================================================
+
+fn first_projection_expr(query: &decypher::ast::Query) -> &decypher::ast::expr::Expression {
+    let QueryBody::SingleQuery(sq) = &query.statements[0] else {
+        panic!("expected SingleQuery");
+    };
+    let decypher::ast::query::SingleQueryKind::SinglePart(spq) = &sq.kind else {
+        panic!("expected SinglePart query");
+    };
+    let SinglePartBody::Return(ret) = &spq.body else {
+        panic!("expected Return body");
+    };
+    &ret.items[0].expression
+}
+
+/// `RETURN [1 + 1]` must parse as a *single* list element that is the
+/// fully composed `1 + 1` binary expression — not two elements (`1` and
+/// `1 + 1`) as a spurious duplicate of the leading atom.
+///
+/// Unit: `parse()` / AST `Literal::List`
+/// Precondition: `RETURN [1 + 1];`.
+/// Expectation: `elements.len() == 1` and that element is `BinaryOp { Add }`.
+#[test]
+fn test_list_literal_element_is_full_binary_expr() {
+    use decypher::ast::expr::{BinaryOperator, Expression, Literal};
+
+    let query = parse("RETURN [1 + 1];").unwrap();
+    match first_projection_expr(&query) {
+        Expression::Literal(Literal::List(list)) => {
+            check!(list.elements.len() == 1);
+            match &list.elements[0] {
+                Expression::BinaryOp { op, .. } => {
+                    check!(*op == BinaryOperator::Add);
+                }
+                other => panic!("expected BinaryOp element, got {other:?}"),
+            }
+        }
+        other => panic!("expected a List literal, got {other:?}"),
+    }
+}
+
+/// `RETURN [a.list[1]]` must parse as a single element that is the full
+/// `a.list[1]` index expression (list = `a.list` PropertyLookup, not just
+/// `a`).
+///
+/// Unit: `parse()` / AST `Literal::List`
+/// Precondition: `RETURN [a.list[1]];`.
+/// Expectation: `elements.len() == 1`; the element is `ListIndex` whose
+/// `list` operand is a `PropertyLookup`.
+#[test]
+fn test_list_literal_element_nested_index() {
+    use decypher::ast::expr::{Expression, Literal};
+
+    let query = parse("RETURN [a.list[1]];").unwrap();
+    match first_projection_expr(&query) {
+        Expression::Literal(Literal::List(list)) => {
+            check!(list.elements.len() == 1);
+            match &list.elements[0] {
+                Expression::ListIndex { list, .. } => match list.as_ref() {
+                    Expression::PropertyLookup { .. } => {}
+                    other => panic!("expected PropertyLookup base, got {other:?}"),
+                },
+                other => panic!("expected ListIndex element, got {other:?}"),
+            }
+        }
+        other => panic!("expected a List literal, got {other:?}"),
+    }
+}
+
+/// `RETURN {a: 1 + 2}` must parse with the entry value being the full
+/// `1 + 2` binary expression, not truncated to `1`.
+///
+/// Unit: `parse()` / AST `Literal::Map`
+/// Precondition: `RETURN {a: 1 + 2};`.
+/// Expectation: one entry whose value is `BinaryOp { Add }`.
+#[test]
+fn test_map_literal_value_is_full_binary_expr() {
+    use decypher::ast::expr::{BinaryOperator, Expression, Literal};
+
+    let query = parse("RETURN {a: 1 + 2};").unwrap();
+    match first_projection_expr(&query) {
+        Expression::Literal(Literal::Map(map)) => {
+            check!(map.entries.len() == 1);
+            match &map.entries[0].1 {
+                Expression::BinaryOp { op, .. } => {
+                    check!(*op == BinaryOperator::Add);
+                }
+                other => panic!("expected BinaryOp value, got {other:?}"),
+            }
+        }
+        other => panic!("expected a Map literal, got {other:?}"),
+    }
+}
+
+/// `RETURN {k: n.prop}` must parse with the entry value being the full
+/// `n.prop` property lookup, not truncated to the bare variable `n`.
+///
+/// Unit: `parse()` / AST `Literal::Map`
+/// Precondition: `RETURN {k: n.prop};`.
+/// Expectation: one entry whose value is `PropertyLookup`.
+#[test]
+fn test_map_literal_value_property_lookup() {
+    use decypher::ast::expr::{Expression, Literal};
+
+    let query = parse("RETURN {k: n.prop};").unwrap();
+    match first_projection_expr(&query) {
+        Expression::Literal(Literal::Map(map)) => {
+            check!(map.entries.len() == 1);
+            match &map.entries[0].1 {
+                Expression::PropertyLookup { .. } => {}
+                other => panic!("expected PropertyLookup value, got {other:?}"),
+            }
+        }
+        other => panic!("expected a Map literal, got {other:?}"),
+    }
+}
+
+/// `UNWIND n.list AS x` must bind the *source* expression to the full
+/// `n.list` property lookup and the *bound variable* to `x` — not conflate
+/// both to the leading atom `n` of the source expression.
+///
+/// Unit: `parse()` / AST `ReadingClause::Unwind`
+/// Precondition: `UNWIND n.list AS x RETURN x;`.
+/// Expectation: `expression` is `PropertyLookup`; `variable.name.name == "x"`.
+#[test]
+fn test_unwind_expression_and_variable_are_not_conflated() {
+    use decypher::ast::expr::Expression;
+    use decypher::ast::query::ReadingClause;
+
+    let query = parse("UNWIND n.list AS x RETURN x;").unwrap();
+    let QueryBody::SingleQuery(sq) = &query.statements[0] else {
+        panic!("expected SingleQuery");
+    };
+    let decypher::ast::query::SingleQueryKind::SinglePart(spq) = &sq.kind else {
+        panic!("expected SinglePart query");
+    };
+    check!(spq.reading_clauses.len() == 1);
+    match &spq.reading_clauses[0] {
+        ReadingClause::Unwind(unwind) => {
+            match &unwind.expression {
+                Expression::PropertyLookup { .. } => {}
+                other => panic!("expected PropertyLookup source, got {other:?}"),
+            }
+            check!(unwind.variable.name.name == "x");
+        }
+        other => panic!("expected Unwind reading clause, got {other:?}"),
+    }
+}
+
+/// `coalesce(x, 1)` must keep the bare-variable first argument `x` — it must
+/// not be silently dropped because it happens to be a `VARIABLE` CST node
+/// (which older code mistook for a leftover callee-name fragment).
+///
+/// Unit: `parse()` / AST `Expression::FunctionCall`
+/// Precondition: `RETURN coalesce(x, 1);`.
+/// Expectation: `arguments.len() == 2`; the first argument is `Variable("x")`.
+#[test]
+fn test_function_call_keeps_bare_variable_argument() {
+    use decypher::ast::expr::Expression;
+
+    let query = parse("RETURN coalesce(x, 1);").unwrap();
+    match first_projection_expr(&query) {
+        Expression::FunctionCall(fi) => {
+            check!(fi.arguments.len() == 2);
+            match &fi.arguments[0] {
+                Expression::Variable(v) => {
+                    check!(v.name.name == "x");
+                }
+                other => panic!("expected Variable argument, got {other:?}"),
+            }
+        }
+        other => panic!("expected a FunctionCall, got {other:?}"),
+    }
+}

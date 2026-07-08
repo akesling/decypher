@@ -681,10 +681,14 @@ impl FunctionInvocation {
             }
 
             if let Some(node) = child.as_node() {
-                if matches!(
-                    node.kind(),
-                    SyntaxKind::FUNCTION_NAME | SyntaxKind::NAMESPACE | SyntaxKind::VARIABLE
-                ) {
+                // `FUNCTION_NAME`/`NAMESPACE` are the callee, never an
+                // argument. Note: `VARIABLE` is deliberately *not* filtered
+                // here — every current call-construction path in the parser
+                // emits an explicit `FUNCTION_NAME` child for the callee, so a
+                // bare `VARIABLE` child is always a legitimate first-position
+                // argument atom (e.g. the `x` in `coalesce(x, 1)`), never a
+                // stray callee-name fragment.
+                if matches!(node.kind(), SyntaxKind::FUNCTION_NAME | SyntaxKind::NAMESPACE) {
                     continue;
                 }
                 if let Some(expr) = Expression::cast(node.clone()) {
@@ -994,7 +998,40 @@ impl AstNode for ListLiteral {
 
 impl ListLiteral {
     pub fn elements(&self) -> impl Iterator<Item = Expression> {
-        self.0.children().filter_map(Expression::cast)
+        // The flat CST exposes a compound element like `[1 + 1]` as sibling
+        // nodes within the same comma-delimited segment, e.g.
+        //   LIST_LITERAL
+        //     └── NUMBER_LITERAL (1)
+        //     └── ADD_SUB_EXPR (+ 1)  ← this is the fully composed element
+        // (`ADD_SUB_EXPR::lhs()` recovers the `1` via `prev_sibling()`.)
+        // Segment children by COMMA and keep only the last Expression-castable
+        // node per segment, mirroring `FunctionInvocation::arguments()`.
+        let mut elements = Vec::new();
+        let mut current = None;
+
+        for child in self.0.children_with_tokens() {
+            if child
+                .as_token()
+                .is_some_and(|t| t.kind() == SyntaxKind::COMMA)
+            {
+                if let Some(expr) = current.take() {
+                    elements.push(expr);
+                }
+                continue;
+            }
+
+            if let Some(node) = child.as_node()
+                && let Some(expr) = Expression::cast(node.clone())
+            {
+                current = Some(expr);
+            }
+        }
+
+        if let Some(expr) = current {
+            elements.push(expr);
+        }
+
+        elements.into_iter()
     }
 }
 
@@ -1056,12 +1093,12 @@ impl MapEntry {
     }
 
     pub fn value(&self) -> Option<Expression> {
-        self.0
-            .children()
-            .filter(|n| {
-                n.kind() != SyntaxKind::PROPERTY_KEY_NAME && n.kind() != SyntaxKind::SYMBOLIC_NAME
-            })
-            .find_map(Expression::cast)
+        // Same flat-CST shape as `WhereClause::expr()`: a compound value like
+        // `{a: 1 + 2}` is stored as sibling nodes `NUMBER_LITERAL(1)`,
+        // `ADD_SUB_EXPR(+ 2)`; the last Expression-castable child is the
+        // fully composed value. `PROPERTY_KEY_NAME` never casts to
+        // `Expression`, so it's already excluded by `filter_map`.
+        self.0.children().filter_map(Expression::cast).last()
     }
 }
 
@@ -1253,10 +1290,15 @@ impl IdInColl {
     }
 
     pub fn collection(&self) -> Option<Expression> {
+        // The loop `VARIABLE` is a genuine sibling to exclude here, but the
+        // collection expression itself may be a compound expression
+        // (`x IN a.list + b.list`), so the last remaining Expression-castable
+        // child — not the first — is the fully composed collection.
         self.0
             .children()
             .filter(|n| n.kind() != SyntaxKind::VARIABLE && n.kind() != SyntaxKind::SYMBOLIC_NAME)
-            .find_map(Expression::cast)
+            .filter_map(Expression::cast)
+            .last()
     }
 }
 
@@ -1430,12 +1472,9 @@ impl MapProjectionItem {
     }
 
     pub fn expression(&self) -> Option<Expression> {
-        self.0
-            .children()
-            .filter(|n| {
-                n.kind() != SyntaxKind::PROPERTY_KEY_NAME && n.kind() != SyntaxKind::SYMBOLIC_NAME
-            })
-            .find_map(Expression::cast)
+        // Same shape as `MapEntry::value()`: keep the last Expression-castable
+        // child so a compound value (`n{x: 1 + 2}`) parses whole.
+        self.0.children().filter_map(Expression::cast).last()
     }
 }
 

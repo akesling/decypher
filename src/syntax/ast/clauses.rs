@@ -248,11 +248,50 @@ impl AstNode for UnwindClause {
 
 impl UnwindClause {
     pub fn expr(&self) -> Option<Expression> {
-        child(&self.0)
+        // In the flat CST, the source expression is the LAST Expression-castable
+        // child appearing before the `AS` keyword, e.g. `UNWIND n.list AS x`:
+        //   UNWIND_CLAUSE
+        //     └── VARIABLE (n)
+        //     └── PROPERTY_LOOKUP (.list)  ← this is the root
+        //     └── KW_AS
+        //     └── VARIABLE (x)
+        // A naive "first child" pick (the old behavior) truncates to `n`.
+        let mut last: Option<Expression> = None;
+        for child in self.0.children_with_tokens() {
+            if let Some(tok) = child.as_token() {
+                if tok.kind() == SyntaxKind::KW_AS {
+                    break;
+                }
+                continue;
+            }
+            if let Some(node) = child.as_node()
+                && let Some(e) = Expression::cast(node.clone())
+            {
+                last = Some(e);
+            }
+        }
+        last
     }
 
     pub fn as_name(&self) -> Option<super::expressions::Variable> {
-        child(&self.0)
+        // The bound variable is the VARIABLE that appears after `AS`, not the
+        // (possibly VARIABLE-headed) source expression before it.
+        let mut seen_as = false;
+        for child in self.0.children_with_tokens() {
+            if let Some(tok) = child.as_token() {
+                if tok.kind() == SyntaxKind::KW_AS {
+                    seen_as = true;
+                }
+                continue;
+            }
+            if seen_as
+                && let Some(node) = child.as_node()
+                && let Some(v) = super::expressions::Variable::cast(node.clone())
+            {
+                return Some(v);
+            }
+        }
+        None
     }
 }
 
@@ -660,11 +699,17 @@ impl ForeachClause {
     }
 
     pub fn list(&self) -> Option<Expression> {
+        // The loop variable is a genuine sibling to exclude, but the list
+        // expression itself may be compound (`FOREACH (x IN a + b | ...)`),
+        // so keep the last remaining Expression-castable child, not the
+        // first. (`PIPE` is a token, not a node, so it never appears in
+        // `.children()`; the nested clauses after it are CLAUSE-kind nodes
+        // that never cast to `Expression`, so no extra boundary is needed.)
         self.0
             .children()
             .filter(|n| n.kind() != SyntaxKind::VARIABLE && n.kind() != SyntaxKind::SYMBOLIC_NAME)
-            .take_while(|n| n.kind() != SyntaxKind::PIPE)
-            .find_map(Expression::cast)
+            .filter_map(Expression::cast)
+            .last()
     }
 
     pub fn clauses(&self) -> AstChildren<Clause> {
@@ -1106,11 +1151,45 @@ impl LoadCsvClause {
     }
 
     pub fn source(&self) -> Option<Expression> {
-        self.0.children().filter_map(Expression::cast).next()
+        // `LOAD CSV FROM <expr> AS var` — the source expression is the LAST
+        // Expression-castable child before `AS` (it may be compound, e.g.
+        // `FROM "a" + "b" AS line`); a naive "first" pick truncates it.
+        let mut last: Option<Expression> = None;
+        for child in self.0.children_with_tokens() {
+            if let Some(tok) = child.as_token() {
+                if tok.kind() == SyntaxKind::KW_AS {
+                    break;
+                }
+                continue;
+            }
+            if let Some(node) = child.as_node()
+                && let Some(e) = Expression::cast(node.clone())
+            {
+                last = Some(e);
+            }
+        }
+        last
     }
 
     pub fn variable(&self) -> Option<super::expressions::Variable> {
-        child(&self.0)
+        // The bound variable is the VARIABLE after `AS`, not (when the source
+        // expression is itself a bare variable) the source's head atom.
+        let mut seen_as = false;
+        for child in self.0.children_with_tokens() {
+            if let Some(tok) = child.as_token() {
+                if tok.kind() == SyntaxKind::KW_AS {
+                    seen_as = true;
+                }
+                continue;
+            }
+            if seen_as
+                && let Some(node) = child.as_node()
+                && let Some(v) = super::expressions::Variable::cast(node.clone())
+            {
+                return Some(v);
+            }
+        }
+        None
     }
 }
 

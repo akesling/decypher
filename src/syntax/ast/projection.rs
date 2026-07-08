@@ -253,7 +253,9 @@ impl AstNode for SkipClause {
 
 impl SkipClause {
     pub fn expr(&self) -> Option<Expression> {
-        child(&self.0)
+        // `expr_bp` allows a compound expression here (e.g. `SKIP $n + 1`);
+        // the last Expression-castable child is the fully composed one.
+        self.0.children().filter_map(Expression::cast).last()
     }
 }
 
@@ -280,6 +282,8 @@ impl AstNode for LimitClause {
 
 impl LimitClause {
     pub fn expr(&self) -> Option<Expression> {
-        child(&self.0)
+        // See `SkipClause::expr()`: keep the last Expression-castable child
+        // so a compound expression here parses whole.
+        self.0.children().filter_map(Expression::cast).last()
     }
 }
