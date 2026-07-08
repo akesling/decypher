@@ -709,7 +709,10 @@ impl FunctionInvocation {
                 // bare `VARIABLE` child is always a legitimate first-position
                 // argument atom (e.g. the `x` in `coalesce(x, 1)`), never a
                 // stray callee-name fragment.
-                if matches!(node.kind(), SyntaxKind::FUNCTION_NAME | SyntaxKind::NAMESPACE) {
+                if matches!(
+                    node.kind(),
+                    SyntaxKind::FUNCTION_NAME | SyntaxKind::NAMESPACE
+                ) {
                     continue;
                 }
                 if let Some(expr) = Expression::cast(node.clone()) {

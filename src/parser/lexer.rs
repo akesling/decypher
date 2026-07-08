@@ -222,6 +222,14 @@ impl<'a> Lexer<'a> {
                 self.bump();
                 Some(self.make_token(SyntaxKind::DOT_DOT, start))
             }
+            /* Leading-dot float literal: `.5`, `.1e-5`, etc. (no integer
+             * part). A `.` directly followed by a digit begins a number;
+             * otherwise it's property-access DOT or the `..` range operator
+             * handled above. */
+            '.' if matches!(self.peek2(), Some(c) if c.is_ascii_digit()) => {
+                let kind = self.read_number(start);
+                Some(self.make_token(kind, start))
+            }
             '/' => {
                 self.bump();
                 Some(self.make_token(SyntaxKind::SLASH, start))

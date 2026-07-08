@@ -78,16 +78,35 @@ pub fn decode_string_content(content: &str, span: Span) -> (String, Option<Cyphe
     (result, None)
 }
 
-/// Parse an integer from a string, handling 0x hex and 0-prefixed octal.
+/// Parse an integer from a string, handling `0x`/`0X` hex, `0o`/`0O` octal,
+/// legacy `0`-prefixed octal, and plain decimal — each optionally preceded
+/// by a single leading `-` sign.
+///
+/// The sign is folded in *before* range-checking (via an `i128`
+/// intermediate) rather than parsed as a positive magnitude and negated
+/// afterwards. This matters for the most-negative `i64` value: its
+/// magnitude, `9223372036854775808`, does not fit in an `i64` even though
+/// the final negated value (`i64::MIN`) does.
 pub fn parse_integer(s: &str) -> Option<i64> {
     let s = s.trim();
-    if s.starts_with("0x") || s.starts_with("0X") {
-        i64::from_str_radix(&s[2..], 16).ok()
-    } else if s.starts_with('0') && s.len() > 1 && s.chars().all(|c| c.is_ascii_digit()) {
-        i64::from_str_radix(s, 8).ok()
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let magnitude: i128 = if digits.starts_with("0x") || digits.starts_with("0X") {
+        i128::from_str_radix(&digits[2..], 16).ok()?
+    } else if digits.starts_with("0o") || digits.starts_with("0O") {
+        i128::from_str_radix(&digits[2..], 8).ok()?
+    } else if digits.starts_with('0')
+        && digits.len() > 1
+        && digits.chars().all(|c| c.is_ascii_digit())
+    {
+        i128::from_str_radix(digits, 8).ok()?
     } else {
-        s.parse::<i64>().ok()
-    }
+        digits.parse::<i128>().ok()?
+    };
+    let signed = if negative { -magnitude } else { magnitude };
+    i64::try_from(signed).ok()
 }
 
 /// Parse a floating-point number from a string.

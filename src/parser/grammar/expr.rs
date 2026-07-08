@@ -1169,14 +1169,26 @@ fn parse_bracket_expr(p: &mut Parser) {
                     None => break,
                 }
             }
-        } else if tok.kind == SyntaxKind::L_PAREN
-            || tok.kind == SyntaxKind::MINUS
-            || tok.kind == SyntaxKind::DASH
-        {
-            // PatternComprehension with optional variable omitted:
-            // [ (node)-[rel]->(node) WHERE ... | expr ]
-            // or [ -[rel]->(node) WHERE ... | expr ] (anonymous start)
+        } else if tok.kind == SyntaxKind::L_PAREN {
+            // PatternComprehension: [ (node)-[rel]->(node) WHERE ... | expr ]
             is_pattern_comprehension = true;
+        } else if tok.kind == SyntaxKind::MINUS || tok.kind == SyntaxKind::DASH {
+            // A leading `-`/dash could start either an anonymous
+            // pattern-comprehension relationship chain
+            // (`[-[rel]->(node) | expr]`) or a negative-number literal as
+            // the first element of a plain list (`[-1, 2]`, `[-1000]`).
+            // Peek past the sign: a digit-led number token means it's a
+            // signed literal, not a pattern dash.
+            let next = loop {
+                match lx.advance() {
+                    Some(t) if t.kind == SyntaxKind::WHITESPACE => continue,
+                    other => break other,
+                }
+            };
+            let is_signed_number = matches!(next, Some(t) if t.kind == SyntaxKind::INTEGER || t.kind == SyntaxKind::FLOAT);
+            if !is_signed_number {
+                is_pattern_comprehension = true;
+            }
         }
     }
 

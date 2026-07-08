@@ -1352,12 +1352,31 @@ fn extract_property_key(e: &ast_c::Expression) -> Result<ast_c::PropertyKeyName>
 
 fn build_unary_expr(u: UnaryExpr) -> Result<ast_c::Expression> {
     let sp = span_of(u.syntax());
-    let operand = u
-        .operand()
-        .map(build_expression)
-        .transpose()?
-        .ok_or_else(|| internal("missing operand", sp))?;
-    match u.op() {
+    let op = u.op();
+    let operand_node = u.operand().ok_or_else(|| internal("missing operand", sp))?;
+    let operand_result = build_expression(operand_node.clone());
+
+    // The classic "most negative i64" edge case: `-9223372036854775808`,
+    // `-0o1000000000000000000000`, `-0x8000000000000000`. Building the bare
+    // operand first (as `build_expression` does above) parses its *positive*
+    // magnitude as an i64 — but the positive magnitude (2^63) overflows i64
+    // even though the negated value (i64::MIN) does not, so that build fails.
+    // Retry by folding the sign into the literal text before range-checking,
+    // via `parse_integer`'s i128 intermediate.
+    if op == Some(UnOp::Neg)
+        && operand_result.is_err()
+        && let Expression::Atom(Atom::Literal(Literal::Number(n))) = &operand_node
+        && let Some(tok) = n.token()
+        && tok.kind() == SyntaxKind::INTEGER
+        && let Some(val) = parse_integer(&format!("-{}", tok.text()))
+    {
+        return Ok(ast_c::Expression::Literal(ast_c::Literal::Number(
+            ast_c::NumberLiteral::Integer(val),
+        )));
+    }
+
+    let operand = operand_result?;
+    match op {
         Some(UnOp::Not) => Ok(ast_c::Expression::UnaryOp {
             op: ast_c::UnaryOperator::Not,
             operand: Box::new(operand),
