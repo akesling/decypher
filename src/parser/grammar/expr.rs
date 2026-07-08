@@ -1283,12 +1283,16 @@ fn parse_filter_expression(p: &mut Parser) {
     p.skip_trivia();
     // Expression (collection)
     expr_bp(p, Prec::MIN);
-    p.builder.finish_node();
-    p.builder.finish_node();
+    p.builder.finish_node(); // close ID_IN_COLL
     p.skip_trivia();
     // Optional WHERE
     if p.at(SyntaxKind::KW_WHERE) {
-        // WHERE is a child of FILTER_EXPRESSION, sibling of ID_IN_COLL
+        // WHERE is a child of FILTER_EXPRESSION, sibling of ID_IN_COLL — so
+        // FILTER_EXPRESSION must still be open here. (A prior version of this
+        // function closed FILTER_EXPRESSION right after ID_IN_COLL, which
+        // pushed WHERE_CLAUSE up to be a sibling of FILTER_EXPRESSION instead
+        // — i.e. a child of the enclosing LIST_COMPREHENSION — silently
+        // detaching the predicate from `FilterExpression::where_clause()`.)
         p.start_node(SyntaxKind::WHERE_CLAUSE);
         p.bump();
         p.skip_trivia();
@@ -1296,6 +1300,7 @@ fn parse_filter_expression(p: &mut Parser) {
         p.builder.finish_node();
         p.skip_trivia();
     }
+    p.builder.finish_node(); // close FILTER_EXPRESSION
 }
 
 fn parse_filter_like_expr(p: &mut Parser) {

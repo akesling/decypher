@@ -666,15 +666,36 @@ impl FunctionInvocation {
     }
 
     pub fn arguments(&self) -> impl Iterator<Item = Expression> {
+        // ALL/ANY/NONE/SINGLE/FILTER/EXTRACT parse via `parse_filter_like_expr`,
+        // which — unlike every other call-argument path — bumps bare `KW_IN` /
+        // `KW_WHERE` / `PIPE` tokens directly as children of FUNCTION_INVOCATION
+        // instead of routing them through a wrapper node (ordinary `x IN list`
+        // composes a `LIST_OP_EXPR`; a WHERE predicate elsewhere always nests
+        // under a `WHERE_CLAUSE`). A bare `KW_IN` child token is therefore an
+        // unambiguous signal for the `binder IN collection [WHERE predicate]
+        // [(,|) mapExpr]` shape: segment on KW_IN/KW_WHERE/PIPE *in addition*
+        // to COMMA so the binder, collection, predicate, and map each land as
+        // their own positional argument instead of collapsing into one
+        // (previously: `all(x IN [1,2,3] WHERE x > 1)` produced a single
+        // mangled argument — the predicate only, with the binder and
+        // collection silently dropped).
+        let is_filter_like = self
+            .0
+            .children_with_tokens()
+            .any(|c| c.as_token().is_some_and(|t| t.kind() == SyntaxKind::KW_IN));
+
         let mut args = Vec::new();
         let mut current = None;
 
         for child in self.0.children_with_tokens() {
-            if child
-                .as_token()
-                .is_some_and(|t| t.kind() == SyntaxKind::COMMA)
-            {
-                if let Some(expr) = current.take() {
+            if let Some(t) = child.as_token() {
+                let is_boundary = t.kind() == SyntaxKind::COMMA
+                    || (is_filter_like
+                        && matches!(
+                            t.kind(),
+                            SyntaxKind::KW_IN | SyntaxKind::KW_WHERE | SyntaxKind::PIPE
+                        ));
+                if is_boundary && let Some(expr) = current.take() {
                     args.push(expr);
                 }
                 continue;
@@ -1160,7 +1181,17 @@ impl ListComprehension {
     }
 
     pub fn body(&self) -> Option<Expression> {
-        self.0.children().filter_map(Expression::cast).last()
+        // `FILTER_EXPRESSION` itself casts to `Expression` (via `Atom::FilterExpression`,
+        // used elsewhere for the ALL/ANY/NONE/SINGLE quantifier shape), so
+        // without excluding it, `[x IN list WHERE pred]` — which has no `|
+        // body` at all — would wrongly report the `FILTER_EXPRESSION` child
+        // itself as the body/map expression. Only a genuine trailing `| body`
+        // expression (the sibling *after* `FILTER_EXPRESSION`) should count.
+        self.0
+            .children()
+            .filter(|n| n.kind() != SyntaxKind::FILTER_EXPRESSION)
+            .filter_map(Expression::cast)
+            .last()
     }
 }
 

@@ -430,3 +430,224 @@ fn test_function_call_keeps_bare_variable_argument() {
         other => panic!("expected a FunctionCall, got {other:?}"),
     }
 }
+
+// ============================================================
+// List-comprehension / quantifier shape regressions
+//
+// `[x IN list [WHERE pred] [| map]]` parses to a `FILTER_EXPRESSION` (holding
+// `ID_IN_COLL` = variable + collection, and an optional `WHERE_CLAUSE`)
+// nested inside `LIST_COMPREHENSION`, with an optional trailing `| map`
+// expression as its sibling. Two bugs conspired to make this unusable:
+//
+// 1. A parser bug closed the `FILTER_EXPRESSION` node one token too early —
+//    right after the collection expression — so `WHERE_CLAUSE` ended up as a
+//    *sibling* of `FILTER_EXPRESSION` (under `LIST_COMPREHENSION`) instead of
+//    nested inside it, silently detaching the predicate from every accessor
+//    that looked for it in the (correct, intended) nested position.
+// 2. The typed-AST `ListComprehension` had no `collection` field at all (the
+//    accessor computed it and then discarded it), and its `body()`/map
+//    accessor mistook the (Expression-castable) `FILTER_EXPRESSION` node
+//    itself for the map expression whenever no `| map` was present.
+//
+// `all/any/none/single(x IN list WHERE pred)` parse as a plain
+// `FUNCTION_INVOCATION` — decypher has no dedicated quantifier grammar node.
+// But the binder, `IN`, collection, `WHERE`, and predicate are all still
+// present as flat children/tokens of that node (unlike an ordinary call's
+// comma-separated arguments, `parse_filter_like_expr` bumps bare `KW_IN` /
+// `KW_WHERE` tokens directly instead of wrapping them), so `arguments()` can
+// — and now does — segment on those boundary tokens too, recovering the
+// binder, collection, and predicate as three separate positional arguments
+// instead of collapsing them into one mangled trailing expression.
+// ============================================================
+
+/// `[x IN [1,2,3] WHERE x > 1]` (WHERE, no map) must expose the full
+/// collection and the WHERE predicate, and must not fabricate a map.
+///
+/// Unit: `parse()` / AST `Expression::ListComprehension`
+/// Precondition: `RETURN [x IN [1,2,3] WHERE x > 1];`.
+/// Expectation: `collection` is a 3-element list, `filter` is `Some(x > 1)`,
+/// `map` is `None`.
+#[test]
+fn test_list_comprehension_where_no_map() {
+    use decypher::ast::expr::{Expression, Literal};
+
+    let query = parse("RETURN [x IN [1,2,3] WHERE x > 1];").unwrap();
+    match first_projection_expr(&query) {
+        Expression::ListComprehension(lc) => {
+            check!(lc.variable.name.name == "x");
+            match lc.collection.as_ref() {
+                Expression::Literal(Literal::List(list)) => {
+                    check!(list.elements.len() == 3);
+                }
+                other => panic!("expected List collection, got {other:?}"),
+            }
+            match lc.filter.as_deref() {
+                Some(Expression::Comparison { .. }) => {}
+                other => panic!("expected Some(Comparison) filter, got {other:?}"),
+            }
+            check!(lc.map.is_none());
+        }
+        other => panic!("expected a ListComprehension, got {other:?}"),
+    }
+}
+
+/// `[x IN [1,2,3] WHERE x > 1 | x*2]` (WHERE and map) must expose all three
+/// of collection, filter, and map simultaneously.
+///
+/// Unit: `parse()` / AST `Expression::ListComprehension`
+/// Precondition: `RETURN [x IN [1,2,3] WHERE x > 1 | x*2];`.
+/// Expectation: `collection` is a 3-element list, `filter` is
+/// `Some(Comparison)`, `map` is `Some(BinaryOp)`.
+#[test]
+fn test_list_comprehension_where_and_map() {
+    use decypher::ast::expr::{Expression, Literal};
+
+    let query = parse("RETURN [x IN [1,2,3] WHERE x > 1 | x*2];").unwrap();
+    match first_projection_expr(&query) {
+        Expression::ListComprehension(lc) => {
+            match lc.collection.as_ref() {
+                Expression::Literal(Literal::List(list)) => {
+                    check!(list.elements.len() == 3);
+                }
+                other => panic!("expected List collection, got {other:?}"),
+            }
+            match lc.filter.as_deref() {
+                Some(Expression::Comparison { .. }) => {}
+                other => panic!("expected Some(Comparison) filter, got {other:?}"),
+            }
+            match &lc.map {
+                Some(Expression::BinaryOp { .. }) => {}
+                other => panic!("expected Some(BinaryOp) map, got {other:?}"),
+            }
+        }
+        other => panic!("expected a ListComprehension, got {other:?}"),
+    }
+}
+
+/// `[x IN [1,2,3] | x*2]` (map, no WHERE) must expose the collection and map,
+/// with `filter` correctly `None` (not a mangled quantifier-shaped node).
+///
+/// Unit: `parse()` / AST `Expression::ListComprehension`
+/// Precondition: `RETURN [x IN [1,2,3] | x*2];`.
+/// Expectation: `collection` is a 3-element list, `filter` is `None`, `map`
+/// is `Some(BinaryOp)`.
+#[test]
+fn test_list_comprehension_map_no_where() {
+    use decypher::ast::expr::{Expression, Literal};
+
+    let query = parse("RETURN [x IN [1,2,3] | x*2];").unwrap();
+    match first_projection_expr(&query) {
+        Expression::ListComprehension(lc) => {
+            match lc.collection.as_ref() {
+                Expression::Literal(Literal::List(list)) => {
+                    check!(list.elements.len() == 3);
+                }
+                other => panic!("expected List collection, got {other:?}"),
+            }
+            check!(lc.filter.is_none());
+            match &lc.map {
+                Some(Expression::BinaryOp { .. }) => {}
+                other => panic!("expected Some(BinaryOp) map, got {other:?}"),
+            }
+        }
+        other => panic!("expected a ListComprehension, got {other:?}"),
+    }
+}
+
+/// `all(x IN [1,2,3] WHERE x > 1)` must recover the binder, collection, and
+/// predicate as three separate positional arguments, instead of collapsing
+/// them into a single mangled trailing expression.
+///
+/// Unit: `parse()` / AST `Expression::FunctionCall`
+/// Precondition: `RETURN all(x IN [1,2,3] WHERE x > 1);`.
+/// Expectation: `arguments.len() == 3`: `Variable("x")`, a 3-element list,
+/// then a `Comparison`.
+#[test]
+fn test_all_quantifier_recovers_binder_collection_predicate() {
+    use decypher::ast::expr::{Expression, Literal};
+
+    let query = parse("RETURN all(x IN [1,2,3] WHERE x > 1);").unwrap();
+    match first_projection_expr(&query) {
+        Expression::FunctionCall(fi) => {
+            check!(fi.name.len() == 1);
+            check!(fi.name[0].name == "all");
+            check!(fi.arguments.len() == 3);
+            match &fi.arguments[0] {
+                Expression::Variable(v) => {
+                    check!(v.name.name == "x");
+                }
+                other => panic!("expected Variable binder, got {other:?}"),
+            }
+            match &fi.arguments[1] {
+                Expression::Literal(Literal::List(list)) => {
+                    check!(list.elements.len() == 3);
+                }
+                other => panic!("expected List collection, got {other:?}"),
+            }
+            match &fi.arguments[2] {
+                Expression::Comparison { .. } => {}
+                other => panic!("expected Comparison predicate, got {other:?}"),
+            }
+        }
+        other => panic!("expected a FunctionCall, got {other:?}"),
+    }
+}
+
+/// `any(x IN [1,2,3] WHERE x > 1)` — same shape as `all`, different keyword.
+///
+/// Unit: `parse()` / AST `Expression::FunctionCall`
+/// Precondition: `RETURN any(x IN [1,2,3] WHERE x > 1);`.
+/// Expectation: `arguments.len() == 3`, same binder/collection/predicate shape.
+#[test]
+fn test_any_quantifier_recovers_binder_collection_predicate() {
+    use decypher::ast::expr::{Expression, Literal};
+
+    let query = parse("RETURN any(x IN [1,2,3] WHERE x > 1);").unwrap();
+    match first_projection_expr(&query) {
+        Expression::FunctionCall(fi) => {
+            check!(fi.name[0].name == "any");
+            check!(fi.arguments.len() == 3);
+            match &fi.arguments[0] {
+                Expression::Variable(v) => {
+                    check!(v.name.name == "x");
+                }
+                other => panic!("expected Variable binder, got {other:?}"),
+            }
+            match &fi.arguments[1] {
+                Expression::Literal(Literal::List(list)) => {
+                    check!(list.elements.len() == 3);
+                }
+                other => panic!("expected List collection, got {other:?}"),
+            }
+            match &fi.arguments[2] {
+                Expression::Comparison { .. } => {}
+                other => panic!("expected Comparison predicate, got {other:?}"),
+            }
+        }
+        other => panic!("expected a FunctionCall, got {other:?}"),
+    }
+}
+
+/// An ordinary function call unrelated to the quantifier shape must be
+/// unaffected by the new KW_IN/KW_WHERE/PIPE segment-boundary logic: a bare
+/// `x IN list` boolean-membership argument composes into a single
+/// `LIST_OP_EXPR`-backed expression (its `KW_IN` token is nested inside that
+/// node, not a direct child of `FUNCTION_INVOCATION`), so it must still come
+/// through as exactly one argument.
+///
+/// Unit: `parse()` / AST `Expression::FunctionCall`
+/// Precondition: `RETURN coalesce(x IN list, 1);`.
+/// Expectation: `arguments.len() == 2` (the `IN` expression, then `1`) — not
+/// 3.
+#[test]
+fn test_function_call_in_expression_argument_not_split() {
+    use decypher::ast::expr::Expression;
+
+    let query = parse("RETURN coalesce(x IN list, 1);").unwrap();
+    match first_projection_expr(&query) {
+        Expression::FunctionCall(fi) => {
+            check!(fi.arguments.len() == 2);
+        }
+        other => panic!("expected a FunctionCall, got {other:?}"),
+    }
+}

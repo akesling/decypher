@@ -318,6 +318,8 @@ pub struct CaseAlternative {
 pub struct ListComprehension {
     /// The element variable bound to each item in the source list.
     pub variable: Variable,
+    /// The source collection expression being iterated.
+    pub collection: Box<Expression>,
     /// Optional `WHERE` filter on elements.
     pub filter: Option<Box<Expression>>,
     /// The `| map` expression, or `None` for identity (`[x IN list]`).

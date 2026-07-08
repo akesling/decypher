@@ -339,6 +339,9 @@ impl<'ast> Visit<'ast> for NameResolver {
     }
 
     fn visit_list_comprehension(&mut self, node: &'ast ListComprehension) {
+        // The source collection is evaluated in the enclosing scope, before
+        // the comprehension variable is bound — same rationale as `visit_unwind`.
+        self.visit_expression(&node.collection);
         self.scopes.push_scope();
         if let Err(first_span) = self.scopes.bind(
             &node.variable.name.name,

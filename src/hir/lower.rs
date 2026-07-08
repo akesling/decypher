@@ -1173,6 +1173,12 @@ impl<'cfg> LoweringContext<'cfg> {
                 })
             }
             Expression::ListComprehension(lc) => {
+                // The source collection is evaluated in the *enclosing* scope
+                // (it must not see the comprehension variable it's about to
+                // define) — mirrors `lower_unwind`, which lowers its source
+                // expression before binding the loop variable for the same
+                // reason.
+                let collection = self.lower_expr(&lc.collection);
                 let _scope = self.scope_stack.push_scope(&mut self.arenas);
                 let var = self.scope_stack.bind(
                     &mut self.arenas,
@@ -1180,7 +1186,6 @@ impl<'cfg> LoweringContext<'cfg> {
                     BindingKind::ComprehensionVar,
                     lc.variable.name.span,
                 );
-                let collection = self.lower_expr(&Expression::Variable(lc.variable.clone()));
                 let filter = lc.filter.as_ref().map(|f| self.lower_expr(f));
                 let map = lc.map.as_ref().map(|m| self.lower_expr(m));
                 self.scope_stack.pop_scope();

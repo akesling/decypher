@@ -1519,6 +1519,7 @@ pub fn walk_case_alternative<'ast, V: Visit<'ast>>(v: &mut V, node: &'ast CaseAl
 
 pub fn walk_list_comprehension<'ast, V: Visit<'ast>>(v: &mut V, node: &'ast ListComprehension) {
     v.visit_variable(&node.variable);
+    v.visit_expression(&node.collection);
     if let Some(f) = &node.filter {
         v.visit_expression(f);
     }
@@ -2104,6 +2105,7 @@ pub fn walk_case_alternative_mut<V: VisitMut>(v: &mut V, node: &mut CaseAlternat
 
 pub fn walk_list_comprehension_mut<V: VisitMut>(v: &mut V, node: &mut ListComprehension) {
     v.visit_variable(&mut node.variable);
+    v.visit_expression(&mut node.collection);
     if let Some(f) = &mut node.filter {
         v.visit_expression(f);
     }

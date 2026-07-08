@@ -1628,11 +1628,11 @@ fn build_list_comprehension(lc: ListComprehension) -> Result<ast_c::Expression> 
             .and_then(|id| id.variable())
             .map(build_variable)
             .ok_or_else(|| internal("missing variable in list comp", sp))?;
-        let _coll = filter
+        let coll = filter
             .id_in_coll()
             .and_then(|id| id.collection())
             .map(build_expression)
-            .ok_or_else(|| internal("missing collection in list comp", sp))?;
+            .ok_or_else(|| internal("missing collection in list comp", sp))??;
         let pred = filter
             .where_clause()
             .and_then(|w| w.expr())
@@ -1642,6 +1642,7 @@ fn build_list_comprehension(lc: ListComprehension) -> Result<ast_c::Expression> 
         Ok(ast_c::Expression::ListComprehension(Box::new(
             ast_c::ListComprehension {
                 variable: var,
+                collection: Box::new(coll),
                 filter: pred.map(Box::new),
                 map,
                 span: sp,

@@ -1079,7 +1079,9 @@ impl ToCypher for ListComprehension {
         write!(w, "[")?;
         self.variable.write_cypher(w)?;
         write!(w, " IN ")?;
+        self.collection.write_cypher(w)?;
         if let Some(filter) = &self.filter {
+            write!(w, " WHERE ")?;
             filter.write_cypher(w)?;
         }
         if let Some(map) = &self.map {
