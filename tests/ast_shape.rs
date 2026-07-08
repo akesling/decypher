@@ -677,3 +677,254 @@ fn test_list_comprehension_bare_identifier_collection() {
         other => panic!("expected a ListComprehension, got {other:?}"),
     }
 }
+
+// ============================================================
+// Pattern predicates & bare label-checks in expression position
+//
+// A bare relationship/node pattern used directly as a boolean expression
+// (`WHERE (n)-[:REL]->()`) and a bare label-check (`WHERE x:Label`) are
+// both valid openCypher expressions. decypher's `(` primary-expression
+// disambiguation (`looks_like_relationships_pattern`, used to decide
+// between a `RelationshipsPattern` atom and a `ParenthesizedExpr`) had an
+// off-by-one bug: it assumed the lexer clone still had the `(` ahead of
+// it, but by the time `parse_atom` dispatches on `SyntaxKind::L_PAREN`, the
+// parser's internal lexer cursor has already advanced past that token. The
+// resulting misaligned scan both missed genuine patterns (`(n)-[:REL]->()`
+// parsed as a truncated grouped expression, silently dropping the WHERE
+// filter) and misfired on ordinary grouped arithmetic followed by a binary
+// `-` (`(-3) - 2`, `(4 ^ 3) - 1`), mistaking the trailing subtraction for
+// the start of a relationship chain.
+// ============================================================
+
+fn match_where_clause(query: &decypher::ast::Query) -> &decypher::ast::expr::Expression {
+    let QueryBody::SingleQuery(sq) = &query.statements[0] else {
+        panic!("expected SingleQuery");
+    };
+    let decypher::ast::query::SingleQueryKind::SinglePart(spq) = &sq.kind else {
+        panic!("expected SinglePart query");
+    };
+    let decypher::ast::query::ReadingClause::Match(m) = &spq.reading_clauses[0] else {
+        panic!("expected Match clause");
+    };
+    m.where_clause
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected a WHERE clause"))
+}
+
+/// `WHERE (n)-[:REL]->()` — a bare relationship pattern in expression
+/// position — must parse as an `Expression::Pattern(RelationshipsPattern)`
+/// whose start node is `n` and which has one relationship chain, not be
+/// silently dropped (`where_clause: None`) or misparsed as arithmetic.
+///
+/// Unit: `parse()` / AST `Expression::Pattern`
+/// Precondition: `MATCH (n) WHERE (n)-[:REL]->() RETURN n;`.
+/// Expectation: `where_clause` is `Pattern` with `start.variable == "n"` and
+///   `chains.len() == 1`.
+#[test]
+fn test_pattern_predicate_in_where_clause() {
+    use decypher::ast::expr::Expression;
+
+    let query = parse("MATCH (n) WHERE (n)-[:REL]->() RETURN n;").unwrap();
+    match match_where_clause(&query) {
+        Expression::Pattern(rp) => {
+            check!(rp.start.variable.as_ref().unwrap().name.name == "n");
+            check!(rp.chains.len() == 1);
+        }
+        other => panic!("expected Expression::Pattern, got {other:?}"),
+    }
+}
+
+/// `WHERE NOT (a)-->(b)` — a pattern predicate under a unary `NOT` — must
+/// keep the pattern as the `NOT`'s operand rather than misfiring the
+/// `(`-vs-grouped-expression heuristic (which previously produced garbage
+/// arithmetic from the `-->` tokens).
+///
+/// Unit: `parse()` / AST `Expression::UnaryOp` / `Expression::Pattern`
+/// Precondition: `MATCH (a) WHERE NOT (a)-->(b) RETURN a;`.
+/// Expectation: `where_clause` is `UnaryOp { op: Not, operand: Pattern(..) }`.
+#[test]
+fn test_not_pattern_predicate() {
+    use decypher::ast::expr::{Expression, UnaryOperator};
+
+    let query = parse("MATCH (a) WHERE NOT (a)-->(b) RETURN a;").unwrap();
+    match match_where_clause(&query) {
+        Expression::UnaryOp { op, operand, .. } => {
+            check!(*op == UnaryOperator::Not);
+            match operand.as_ref() {
+                Expression::Pattern(rp) => {
+                    check!(rp.chains.len() == 1);
+                }
+                other => panic!("expected Pattern operand, got {other:?}"),
+            }
+        }
+        other => panic!("expected Expression::UnaryOp, got {other:?}"),
+    }
+}
+
+/// A pattern predicate followed by a trailing boolean operator —
+/// `(n)-[:R]->() AND n.x > 1` — must compose the pattern as the `AND`'s
+/// left-hand side rather than being truncated at the pattern's closing
+/// `)`. This is the same root cause as the plain pattern-predicate case:
+/// once `(n)-[:R]->()` parses as a single primary expression (an atom),
+/// the surrounding Pratt loop naturally continues into `AND n.x > 1` like
+/// any other atom.
+///
+/// Unit: `parse()` / AST `Expression::BinaryOp`
+/// Precondition: `MATCH (n) WHERE (n)-[:R]->() AND n.x > 1 RETURN n;`.
+/// Expectation: `where_clause` is `BinaryOp { op: And, lhs: Pattern(..), .. }`.
+#[test]
+fn test_pattern_predicate_with_trailing_and() {
+    use decypher::ast::expr::{BinaryOperator, Expression};
+
+    let query = parse("MATCH (n) WHERE (n)-[:R]->() AND n.x > 1 RETURN n;").unwrap();
+    match match_where_clause(&query) {
+        Expression::BinaryOp { op, lhs, .. } => {
+            check!(*op == BinaryOperator::And);
+            match lhs.as_ref() {
+                Expression::Pattern(_) => {}
+                other => panic!("expected Pattern lhs, got {other:?}"),
+            }
+        }
+        other => panic!("expected Expression::BinaryOp, got {other:?}"),
+    }
+}
+
+/// `WHERE x:Label` — a bare node-variable label test used as a boolean
+/// expression (not inside a MATCH pattern) — must parse as
+/// `Expression::NodeLabels`.
+///
+/// Unit: `parse()` / AST `Expression::NodeLabels`
+/// Precondition: `MATCH (n) WHERE x:Label RETURN n;`.
+/// Expectation: `where_clause` is `NodeLabels { base: Variable("x"), .. }`.
+#[test]
+fn test_bare_label_check_expression() {
+    use decypher::ast::expr::Expression;
+
+    let query = parse("MATCH (n) WHERE x:Label RETURN n;").unwrap();
+    match match_where_clause(&query) {
+        Expression::NodeLabels { base, labels, .. } => {
+            match base.as_ref() {
+                Expression::Variable(v) => {
+                    check!(v.name.name == "x");
+                }
+                other => panic!("expected Variable base, got {other:?}"),
+            }
+            check!(labels.len() == 1);
+        }
+        other => panic!("expected Expression::NodeLabels, got {other:?}"),
+    }
+}
+
+/// A bare label-check whose label name is a non-reserved (contextual)
+/// keyword — e.g. `TYPE` — must still parse. `is_label_check_follow` used
+/// to gate the postfix `:Label` production on a fixed set of token kinds
+/// that excluded contextual keywords, even though `parse_label_atom`
+/// itself already accepted them (matching NodePattern label position).
+///
+/// Unit: `parse()` / AST `Expression::NodeLabels`
+/// Precondition: `MATCH (m) RETURN m:TYPE;`.
+/// Expectation: `parse()` succeeds; the projection expression is
+///   `NodeLabels` with label name `"TYPE"`.
+#[test]
+fn test_label_check_with_contextual_keyword() {
+    use decypher::ast::expr::Expression;
+    use decypher::ast::pattern::LabelExpression;
+
+    let query = parse("MATCH (m) RETURN m:TYPE;").unwrap();
+    match first_projection_expr(&query) {
+        Expression::NodeLabels { labels, .. } => {
+            check!(labels.len() == 1);
+            match &labels[0] {
+                LabelExpression::Static(name) => {
+                    check!(name.name == "TYPE");
+                }
+                other => panic!("expected Static label, got {other:?}"),
+            }
+        }
+        other => panic!("expected Expression::NodeLabels, got {other:?}"),
+    }
+}
+
+/// `RETURN (1 + 2)` must still parse as a grouped arithmetic expression —
+/// the pattern-predicate `(`-disambiguation must not misfire on an ordinary
+/// parenthesized expression that contains no relationship chain at all.
+///
+/// Unit: `parse()` / AST `Expression::Parenthesized`
+/// Precondition: `RETURN (1 + 2);`.
+/// Expectation: `Parenthesized(BinaryOp { op: Add, .. })`.
+#[test]
+fn test_grouped_arithmetic_expr_unaffected() {
+    use decypher::ast::expr::{BinaryOperator, Expression};
+
+    let query = parse("RETURN (1 + 2);").unwrap();
+    match first_projection_expr(&query) {
+        Expression::Parenthesized(inner) => match inner.as_ref() {
+            Expression::BinaryOp { op, .. } => {
+                check!(*op == BinaryOperator::Add);
+            }
+            other => panic!("expected BinaryOp inside parens, got {other:?}"),
+        },
+        other => panic!("expected Expression::Parenthesized, got {other:?}"),
+    }
+}
+
+/// `RETURN (-3) - 2` must parse as subtraction of `2` from the grouped
+/// `-3`, not be misdetected as a pattern (the old heuristic saw the `)`
+/// immediately followed by `-` and treated it as the start of a
+/// relationship chain, since it never checked what came *after* that `-`).
+///
+/// Unit: `parse()` / AST `Expression::BinaryOp`
+/// Precondition: `RETURN (-3) - 2;`.
+/// Expectation: `BinaryOp { op: Subtract, lhs: Parenthesized(..), .. }`.
+#[test]
+fn test_parenthesized_unary_minus_then_subtraction_unaffected() {
+    use decypher::ast::expr::{BinaryOperator, Expression};
+
+    let query = parse("RETURN (-3) - 2;").unwrap();
+    match first_projection_expr(&query) {
+        Expression::BinaryOp { op, lhs, .. } => {
+            check!(*op == BinaryOperator::Subtract);
+            match lhs.as_ref() {
+                Expression::Parenthesized(_) => {}
+                other => panic!("expected Parenthesized lhs, got {other:?}"),
+            }
+        }
+        other => panic!("expected Expression::BinaryOp, got {other:?}"),
+    }
+}
+
+/// A normal `MATCH` pattern with a relationship chain — as opposed to a
+/// bare pattern used as an expression — must still parse as a genuine
+/// `PatternElement::Path` with one chain. `MATCH`-clause pattern parsing
+/// never goes through the `(`-vs-grouped-expression primary-expression
+/// disambiguation at all, so this is unaffected by construction, but is
+/// worth pinning down explicitly.
+///
+/// Unit: `parse()` / AST `PatternElement::Path`
+/// Precondition: `MATCH (n)-[:R]->(m) RETURN n;`.
+/// Expectation: one pattern part whose `Path` has `chains.len() == 1`.
+#[test]
+fn test_normal_match_pattern_with_chain_unaffected() {
+    let query = parse("MATCH (n)-[:R]->(m) RETURN n;").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            decypher::ast::query::SingleQueryKind::SinglePart(spq) => {
+                match &spq.reading_clauses[0] {
+                    decypher::ast::query::ReadingClause::Match(m) => {
+                        check!(m.pattern.parts.len() == 1);
+                        match &m.pattern.parts[0].anonymous.element {
+                            decypher::ast::pattern::PatternElement::Path { start, chains } => {
+                                check!(start.variable.as_ref().unwrap().name.name == "n");
+                                check!(chains.len() == 1);
+                            }
+                            _ => panic!("expected Path pattern element"),
+                        }
+                    }
+                    _ => panic!("expected Match clause"),
+                }
+            }
+            _ => panic!("expected SinglePart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}

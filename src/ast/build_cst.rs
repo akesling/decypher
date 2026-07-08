@@ -1440,7 +1440,29 @@ fn build_atom(a: Atom) -> Result<ast_c::Expression> {
             })
         }
         Atom::Null(_n) => Ok(ast_c::Expression::Literal(ast_c::Literal::Null)),
+        Atom::Pattern(rp) => Ok(ast_c::Expression::Pattern(build_relationships_pattern(rp)?)),
     }
+}
+
+/// Build a bare pattern-predicate (`Atom::Pattern`) — a `RelationshipsPattern`
+/// used directly as a boolean expression, e.g. `WHERE (n)-[:REL]->()` — into
+/// the typed AST. Shares `build_node_pattern`/`build_pattern_element_chain`
+/// with the `MATCH`-clause pattern builder and with `EXISTS(pattern)`
+/// (`build_exists_subquery`), since all three parse the same underlying
+/// `NodePattern (PatternElementChain)*` shape.
+fn build_relationships_pattern(rp: RelationshipsPattern) -> Result<ast_c::RelationshipsPattern> {
+    let sp = span_of(rp.syntax());
+    let start = rp
+        .node_pattern()
+        .map(build_node_pattern)
+        .transpose()?
+        .ok_or_else(|| internal("missing node pattern in relationships pattern", sp))?;
+    let chains: Result<Vec<_>> = rp.chains().map(build_pattern_element_chain).collect();
+    Ok(ast_c::RelationshipsPattern {
+        start,
+        chains: chains?,
+        span: sp,
+    })
 }
 
 fn build_literal(l: Literal) -> Result<ast_c::Expression> {

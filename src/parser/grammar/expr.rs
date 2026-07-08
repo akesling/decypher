@@ -1,5 +1,6 @@
 use crate::error::Expected;
 use crate::parser::Parser;
+use crate::parser::lexer::Lexer;
 use crate::syntax::SyntaxKind;
 use std::borrow::Cow;
 
@@ -260,7 +261,15 @@ fn is_label_check_follow(p: &Parser) -> bool {
                 | SyntaxKind::DOLLAR
                 | SyntaxKind::BANG
         )
-    )
+    ) || p.peek_next_non_trivia().is_some_and(|kind| {
+        // A non-reserved (contextual) keyword — e.g. `x:TYPE` — is a valid
+        // label name too, same as in NodePattern label position
+        // (`parse_label_atom`). `WHERE` is excluded there to avoid eating
+        // the pattern's own where-clause; mirror that here for consistency
+        // even though a bare label-check has no such clause to compete
+        // with.
+        is_name_keyword_kind(kind) && kind != SyntaxKind::KW_WHERE
+    })
 }
 
 fn parse_postfix_node_labels(p: &mut Parser) {
@@ -722,7 +731,7 @@ fn parse_atom(p: &mut Parser) {
             // Check if this is a RelationshipsPattern (pattern-as-atom)
             // Peeking: after ( should be optional var, optional :Label, optional {props}, then )
             // followed by - or < for chain start
-            if looks_like_relationships_pattern(p) {
+            if looks_like_bare_relationships_pattern(p) {
                 p.start_node(SyntaxKind::RELATIONSHIPS_PATTERN);
                 parse_node_pattern_for_atom(p);
                 p.skip_trivia();
@@ -1032,6 +1041,16 @@ fn parse_map_projection_item(p: &mut Parser) {
 /// Determine if we're looking at a RelationshipsPattern starting from `(`.
 /// Heuristic: after (, we expect optional var, optional :Label, optional {props}, )
 /// and then - or < for a chain. If there's no chain after ), it's just a parenthesized expr.
+/// Look ahead from `p`'s *current* token — which must be positioned
+/// **before** the `(` under consideration (e.g. at the `EXISTS` keyword,
+/// with the `(` of `EXISTS(...)` still unconsumed) — to decide whether that
+/// upcoming parenthesized group is a `RelationshipsPattern` or a plain
+/// argument expression.
+///
+/// This is *not* suitable for the `parse_atom` primary-expression dispatch
+/// on `L_PAREN` itself: once `p.current_kind() == L_PAREN`, the parser's
+/// internal lexer cursor has already advanced past that token (see
+/// [`looks_like_bare_relationships_pattern`], which handles that case).
 fn looks_like_relationships_pattern(p: &Parser) -> bool {
     // Clone lexer to peek ahead
     let mut lx = p.lexer.clone();
@@ -1089,6 +1108,87 @@ fn looks_like_relationships_pattern(p: &Parser) -> bool {
             }
             _ => return false,
         }
+    }
+}
+
+/// Determine whether the group starting at the upcoming `(` — with `p`
+/// **currently positioned at that `L_PAREN`** (not yet consumed) — is a
+/// bare `RelationshipsPattern` used as an expression (a pattern predicate,
+/// e.g. `(n)-[:REL]->()`, `WHERE NOT (a)-->(b)`) rather than a grouped
+/// (parenthesized) expression (e.g. `(1 + 2)`, `(-3) - 2`).
+///
+/// Because `p.current_kind() == L_PAREN` here, the parser's internal lexer
+/// cursor (`p.lexer`) has *already* advanced past that `(` — unlike
+/// [`looks_like_relationships_pattern`], whose callers still have the `(`
+/// ahead of them. Cloning `p.lexer` therefore starts scanning from the
+/// first token *inside* the parenthesized group, not from the `(` itself.
+fn looks_like_bare_relationships_pattern(p: &Parser) -> bool {
+    let mut lx = p.lexer.clone();
+    // Scan to the `)` that closes this initial group, tracking nested
+    // delimiters (property maps, dynamic labels, list indices, nested
+    // parens, …) so a `)`/`]`/`}` belonging to an inner construct doesn't
+    // get mistaken for the group's own close paren.
+    let mut depth: i32 = 0;
+    loop {
+        let tok = match lx.advance() {
+            Some(t) => t,
+            None => return false,
+        };
+        match tok.kind {
+            SyntaxKind::L_PAREN | SyntaxKind::L_BRACKET | SyntaxKind::L_BRACE => depth += 1,
+            SyntaxKind::R_BRACKET | SyntaxKind::R_BRACE => depth -= 1,
+            SyntaxKind::R_PAREN => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    relationship_chain_follows(&mut lx)
+}
+
+/// After a closing `)`, decide whether what follows continues a
+/// relationship chain (`-[`, `--`, `-->`, `<-`) — meaning the group just
+/// scanned was a `NodePattern` — versus a lone `-`/`<` that's an ordinary
+/// binary operator (subtraction, less-than) applied to a grouped
+/// expression's *result*. A single dash or angle-bracket token is
+/// ambiguous on its own (`(-3) - 2` vs. `(n)-[:R]->()` both have `)`
+/// immediately followed by `-`); what immediately follows *that* token
+/// (ignoring trivia) disambiguates: `-[`, `--`, `-->` start a chain, a dash
+/// followed by anything else (whitespace then an operand) is subtraction.
+fn relationship_chain_follows(lx: &mut Lexer) -> bool {
+    fn next_non_trivia(lx: &mut Lexer) -> Option<crate::parser::lexer::Token> {
+        loop {
+            match lx.advance() {
+                Some(tok)
+                    if tok.kind == SyntaxKind::WHITESPACE || tok.kind == SyntaxKind::COMMENT =>
+                {
+                    continue;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    match next_non_trivia(lx) {
+        Some(tok) if matches!(tok.kind, SyntaxKind::MINUS | SyntaxKind::DASH) => matches!(
+            next_non_trivia(lx),
+            Some(tok) if matches!(
+                tok.kind,
+                SyntaxKind::L_BRACKET
+                    | SyntaxKind::MINUS
+                    | SyntaxKind::DASH
+                    | SyntaxKind::GT
+                    | SyntaxKind::ARROW_RIGHT
+            )
+        ),
+        Some(tok) if matches!(tok.kind, SyntaxKind::LT | SyntaxKind::ARROW_LEFT) => matches!(
+            next_non_trivia(lx),
+            Some(tok) if matches!(tok.kind, SyntaxKind::MINUS | SyntaxKind::DASH)
+        ),
+        _ => false,
     }
 }
 
@@ -3107,8 +3207,15 @@ fn parse_finish_clause(p: &mut Parser) {
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn is_keyword_as_name(p: &Parser) -> bool {
+    is_name_keyword_kind(p.current_kind())
+}
+
+/// [`SyntaxKind`]-only variant of [`is_keyword_as_name`], usable against a
+/// peeked/looked-ahead token kind rather than the parser's current token
+/// (e.g. `p.peek_next_non_trivia()`).
+fn is_name_keyword_kind(kind: SyntaxKind) -> bool {
     matches!(
-        p.current_kind(),
+        kind,
         SyntaxKind::KW_ACCESS
             | SyntaxKind::KW_ADD
             | SyntaxKind::KW_ALL

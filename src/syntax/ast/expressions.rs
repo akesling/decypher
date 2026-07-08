@@ -1,5 +1,6 @@
 use crate::syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 
+use super::patterns::RelationshipsPattern;
 use super::support::{AstChildren, child, child_token, children};
 use super::traits::AstNode;
 
@@ -309,6 +310,9 @@ pub enum Atom {
     ImplicitProcedureInvocation(ImplicitProcedureInvocation),
     PropertyLookup(PropertyLookup),
     Null(NullLiteral),
+    /// A bare relationship/node pattern used directly as a boolean
+    /// expression (a pattern predicate), e.g. `WHERE (n)-[:REL]->()`.
+    Pattern(RelationshipsPattern),
 }
 
 impl AstNode for Atom {
@@ -336,6 +340,7 @@ impl AstNode for Atom {
                 | SyntaxKind::MAP_PROJECTION
                 | SyntaxKind::IMPLICIT_PROCEDURE_INVOCATION
                 | SyntaxKind::PROPERTY_LOOKUP
+                | SyntaxKind::RELATIONSHIPS_PATTERN
         )
     }
 
@@ -376,6 +381,9 @@ impl AstNode for Atom {
                 ImplicitProcedureInvocation::cast(syntax).map(Atom::ImplicitProcedureInvocation)
             }
             SyntaxKind::PROPERTY_LOOKUP => PropertyLookup::cast(syntax).map(Atom::PropertyLookup),
+            SyntaxKind::RELATIONSHIPS_PATTERN => {
+                RelationshipsPattern::cast(syntax).map(Atom::Pattern)
+            }
             _ => None,
         }
     }
@@ -400,6 +408,7 @@ impl AstNode for Atom {
             Atom::ImplicitProcedureInvocation(it) => it.syntax(),
             Atom::PropertyLookup(it) => it.syntax(),
             Atom::Null(it) => it.syntax(),
+            Atom::Pattern(it) => it.syntax(),
         }
     }
 }
