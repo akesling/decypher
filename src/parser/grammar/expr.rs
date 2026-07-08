@@ -576,7 +576,19 @@ fn parse_atom(p: &mut Parser) {
         | SyntaxKind::KW_KEY
         // `range` is also the CREATE RANGE INDEX keyword; like the keywords
         // above, accept it here as a function name / call.
-        | SyntaxKind::KW_RANGE => {
+        | SyntaxKind::KW_RANGE
+        // NODE, PROPERTY, ROWS, and TYPES are non-reserved (contextual)
+        // keywords per openCypher: they introduce specific constructs
+        // elsewhere (e.g. `NODE KEY` constraints, `IN TRANSACTIONS OF n
+        // ROWS`), but are otherwise ordinary identifiers and must remain
+        // usable as bare variable/expression references (`RETURN node`,
+        // `WITH 1 AS rows`, `size(types)`). Unlike those, genuinely reserved
+        // words (MATCH, RETURN, WHERE, WITH, CREATE, ...) are deliberately
+        // *not* added here — they must stay unusable as expression atoms.
+        | SyntaxKind::KW_NODE
+        | SyntaxKind::KW_PROPERTY
+        | SyntaxKind::KW_ROWS
+        | SyntaxKind::KW_TYPES => {
             // Detect qualified function calls: `ns1.ns2.name(args)`. We can't
             // rewrite from a VARIABLE + PROPERTY_LOOKUP chain after the fact,
             // so look ahead before committing and build a FUNCTION_INVOCATION
@@ -1392,7 +1404,11 @@ fn parse_map_entry(p: &mut Parser) {
         } else {
             p.start_node(SyntaxKind::PROPERTY_KEY_NAME);
             p.start_node(SyntaxKind::SYMBOLIC_NAME);
-            if p.at(SyntaxKind::IDENT) || p.at(SyntaxKind::ESCAPED_IDENT) || is_keyword_as_name(p) {
+            if p.at(SyntaxKind::IDENT)
+                || p.at(SyntaxKind::ESCAPED_IDENT)
+                || is_keyword_as_name(p)
+                || is_map_key_keyword(p)
+            {
                 p.bump();
             }
             p.builder.finish_node();
@@ -1401,7 +1417,11 @@ fn parse_map_entry(p: &mut Parser) {
     } else {
         p.start_node(SyntaxKind::PROPERTY_KEY_NAME);
         p.start_node(SyntaxKind::SYMBOLIC_NAME);
-        if p.at(SyntaxKind::IDENT) || p.at(SyntaxKind::ESCAPED_IDENT) || is_keyword_as_name(p) {
+        if p.at(SyntaxKind::IDENT)
+            || p.at(SyntaxKind::ESCAPED_IDENT)
+            || is_keyword_as_name(p)
+            || is_map_key_keyword(p)
+        {
             p.bump();
         }
         p.builder.finish_node();
@@ -3187,5 +3207,23 @@ fn is_keyword_as_name(p: &Parser) -> bool {
             | SyntaxKind::KW_CSV
             | SyntaxKind::KW_FINISH
             | SyntaxKind::KW_FIELDTERMINATOR
+    )
+}
+
+/// Whether the current token can be used as an unquoted map-literal /
+/// property-map key, in addition to everything [`is_keyword_as_name`]
+/// already allows there.
+///
+/// openCypher's `SchemaName` production (which backs `PropertyKeyName`)
+/// explicitly includes `reservedWord`, and `TRUE` / `FALSE` / `NULL` are
+/// part of that reserved-word set (they're lexed as their own dedicated
+/// [`SyntaxKind`]s — `TRUE_KW`, `FALSE_KW`, `NULL_KW` — rather than as
+/// generic keyword tokens, so they aren't covered by
+/// [`is_keyword_as_name`]). This makes `{null: 1}` and `{true: 1, false: 2}`
+/// valid map keys, matching the reference grammar.
+fn is_map_key_keyword(p: &Parser) -> bool {
+    matches!(
+        p.current_kind(),
+        SyntaxKind::NULL_KW | SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW
     )
 }
