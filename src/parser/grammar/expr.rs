@@ -1735,7 +1735,18 @@ fn parse_set_clause(p: &mut Parser) {
 
 fn parse_set_item(p: &mut Parser) {
     p.start_node(SyntaxKind::SET_ITEM);
-    if p.at(SyntaxKind::IDENT) || p.at(SyntaxKind::ESCAPED_IDENT) || is_keyword_as_name(p) {
+    if p.at(SyntaxKind::L_PAREN) {
+        // A parenthesized expression used as a dynamic property-mutation
+        // target, e.g. `SET (n).name = 'x'` (vs. the plain `SET n.name =
+        // 'x'` handled below). openCypher's `PropertyExpression` grammar is
+        // `Atom (PropertyLookup)+`, and `Atom` includes a parenthesized
+        // group — so parse the general postfix-expression chain (grouped
+        // atom plus any `.property` lookups), stopping strictly before the
+        // `=`/`+=` operator so it doesn't get swallowed as an equality
+        // comparison.
+        expr_bp(p, Prec::POSTFIX);
+        p.skip_trivia();
+    } else if p.at(SyntaxKind::IDENT) || p.at(SyntaxKind::ESCAPED_IDENT) || is_keyword_as_name(p) {
         p.start_node(SyntaxKind::VARIABLE);
         p.start_node(SyntaxKind::SYMBOLIC_NAME);
         p.bump();

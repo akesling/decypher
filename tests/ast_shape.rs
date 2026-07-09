@@ -928,3 +928,269 @@ fn test_normal_match_pattern_with_chain_unaffected() {
         _ => panic!("expected SingleQuery"),
     }
 }
+
+// ── Multi-part query ending in an updating clause, no trailing RETURN ──
+//
+// openCypher allows a multi-part (`WITH`-joined) query to end in a run of
+// updating clauses with no trailing `RETURN`/`FINISH` — the same shape
+// `SinglePartBody::Updating { return_clause: None, .. }` already represents
+// for single-part writes. Previously the multi-part AST builder required a
+// `RETURN`/`FINISH`/final-`WITH` to set `final_part` and raised
+// `Internal("multi-part query missing final part")` otherwise.
+
+/// `MATCH (a) WITH a CREATE (a)-[:R]->()` — a multi-part query whose final
+/// part is a bare `CREATE` with no `RETURN` — must parse, with the `CREATE`
+/// exposed on `final_part.body` as `SinglePartBody::Updating` and
+/// `return_clause == None`.
+///
+/// Unit: `parse()` / AST `MultiPartQuery::final_part`
+/// Precondition: `MATCH (a) WITH a CREATE (a)-[:R]->();`.
+/// Expectation: one intermediate part (the `MATCH … WITH a`), and
+/// `final_part.body` is `Updating { updating: [Create(_)], return_clause: None }`.
+#[test]
+fn test_multipart_final_updating_no_return() {
+    use decypher::ast::query::{SingleQueryKind, UpdatingClause};
+
+    let query = parse("MATCH (a) WITH a CREATE (a)-[:R]->();").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            SingleQueryKind::MultiPart(mpq) => {
+                check!(mpq.parts.len() == 1);
+                match &mpq.final_part.body {
+                    SinglePartBody::Updating {
+                        updating,
+                        return_clause,
+                    } => {
+                        check!(updating.len() == 1);
+                        check!(matches!(updating[0], UpdatingClause::Create(_)));
+                        check!(return_clause.is_none());
+                    }
+                    other => panic!("expected Updating final-part body, got {other:?}"),
+                }
+            }
+            _ => panic!("expected MultiPart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}
+
+/// `UNWIND [1,2] AS x CREATE (:N {v:x})` has no `WITH`, so it is a
+/// single-part query — the updating-with-no-RETURN shape it needs
+/// (`SinglePartBody::Updating { return_clause: None, .. }`) already existed
+/// before this fix; pinned here as a sibling regression case to the
+/// multi-part fix above.
+///
+/// Unit: `parse()` / AST `SinglePartBody`
+/// Precondition: `UNWIND [1,2] AS x CREATE (:N {v:x});`.
+/// Expectation: `SinglePart` query, `Updating` body with one `Create` clause
+/// and no `RETURN`.
+#[test]
+fn test_unwind_create_no_with_has_updating_body() {
+    use decypher::ast::query::{SingleQueryKind, UpdatingClause};
+
+    let query = parse("UNWIND [1,2] AS x CREATE (:N {v:x});").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            SingleQueryKind::SinglePart(spq) => {
+                check!(spq.reading_clauses.len() == 1);
+                match &spq.body {
+                    SinglePartBody::Updating {
+                        updating,
+                        return_clause,
+                    } => {
+                        check!(updating.len() == 1);
+                        check!(matches!(updating[0], UpdatingClause::Create(_)));
+                        check!(return_clause.is_none());
+                    }
+                    other => panic!("expected Updating body, got {other:?}"),
+                }
+            }
+            _ => panic!("expected SinglePart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}
+
+/// `MATCH (n) WITH n DELETE n` — a multi-part query ending in `DELETE`
+/// with no `RETURN` — must parse the same way as the `CREATE` case above.
+///
+/// Unit: `parse()` / AST `MultiPartQuery::final_part`
+/// Precondition: `MATCH (n) WITH n DELETE n;`.
+/// Expectation: `final_part.body` is `Updating { updating: [Delete(_)],
+/// return_clause: None }`.
+#[test]
+fn test_multipart_match_with_delete_no_return() {
+    use decypher::ast::query::{SingleQueryKind, UpdatingClause};
+
+    let query = parse("MATCH (n) WITH n DELETE n;").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            SingleQueryKind::MultiPart(mpq) => match &mpq.final_part.body {
+                SinglePartBody::Updating {
+                    updating,
+                    return_clause,
+                } => {
+                    check!(updating.len() == 1);
+                    check!(matches!(updating[0], UpdatingClause::Delete(_)));
+                    check!(return_clause.is_none());
+                }
+                other => panic!("expected Updating final-part body, got {other:?}"),
+            },
+            _ => panic!("expected MultiPart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}
+
+/// Unaffected: `MATCH (a) WITH a RETURN a` — a multi-part query whose final
+/// part still ends in `RETURN` — must still parse the same as before, with
+/// `final_part.body` as `SinglePartBody::Return`.
+///
+/// Unit: `parse()` / AST `MultiPartQuery::final_part`
+/// Precondition: `MATCH (a) WITH a RETURN a;`.
+/// Expectation: `final_part.body` is `SinglePartBody::Return(_)`.
+#[test]
+fn test_multipart_ending_in_return_unaffected() {
+    use decypher::ast::query::SingleQueryKind;
+
+    let query = parse("MATCH (a) WITH a RETURN a;").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            SingleQueryKind::MultiPart(mpq) => {
+                check!(matches!(mpq.final_part.body, SinglePartBody::Return(_)));
+            }
+            _ => panic!("expected MultiPart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}
+
+/// Unaffected: single-part `CREATE (n) RETURN n` — updating clause followed
+/// by `RETURN` in the same (non-`WITH`-joined) part — must still parse.
+///
+/// Unit: `parse()` / AST `SinglePartBody`
+/// Precondition: `CREATE (n) RETURN n;`.
+/// Expectation: `SinglePart` query, `Updating` body with one `Create` and
+/// `return_clause.is_some()`.
+#[test]
+fn test_single_part_create_return_unaffected() {
+    use decypher::ast::query::SingleQueryKind;
+
+    let query = parse("CREATE (n) RETURN n;").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            SingleQueryKind::SinglePart(spq) => match &spq.body {
+                SinglePartBody::Updating {
+                    updating,
+                    return_clause,
+                } => {
+                    check!(updating.len() == 1);
+                    check!(return_clause.is_some());
+                }
+                other => panic!("expected Updating body, got {other:?}"),
+            },
+            _ => panic!("expected SinglePart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}
+
+// ── SET on a parenthesized-expression target ────────────────────────────
+//
+// openCypher's `PropertyExpression` grammar is `Atom (PropertyLookup)+`,
+// and `Atom` includes a parenthesized group — so `(n).prop` is a valid
+// property-mutation target, same as the bare `n.prop`. Previously
+// `parse_set_item` only accepted a bare variable as the SET target.
+
+/// `SET (n).prop = 1` — a parenthesized node expression as the SET
+/// target — must parse as `SetItem::Property` whose `property` is a
+/// `PropertyLookup` with a `Parenthesized(Variable(n))` base.
+///
+/// Unit: `parse()` / AST `SetItem`
+/// Precondition: `MATCH (n) SET (n).prop = 1;`.
+/// Expectation: one `SetItem::Property` whose `property` is
+/// `Expression::PropertyLookup { base: Expression::Parenthesized(box
+/// Expression::Variable(n)), property: "prop" }`.
+#[test]
+fn test_set_parenthesized_target() {
+    use decypher::ast::clause::SetItem;
+    use decypher::ast::expr::Expression;
+    use decypher::ast::query::{ReadingClause, SingleQueryKind, UpdatingClause};
+
+    let query = parse("MATCH (n) SET (n).prop = 1;").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            SingleQueryKind::SinglePart(spq) => {
+                check!(matches!(spq.reading_clauses[0], ReadingClause::Match(_)));
+                match &spq.body {
+                    SinglePartBody::Updating { updating, .. } => {
+                        check!(updating.len() == 1);
+                        match &updating[0] {
+                            UpdatingClause::Set(set) => {
+                                check!(set.items.len() == 1);
+                                match &set.items[0] {
+                                    SetItem::Property { property, .. } => match property {
+                                        Expression::PropertyLookup { base, property, .. } => {
+                                            check!(property.name.name == "prop");
+                                            check!(matches!(
+                                                base.as_ref(),
+                                                Expression::Parenthesized(inner)
+                                                    if matches!(inner.as_ref(), Expression::Variable(v) if v.name.name == "n")
+                                            ));
+                                        }
+                                        other => panic!("expected PropertyLookup, got {other:?}"),
+                                    },
+                                    other => panic!("expected SetItem::Property, got {other:?}"),
+                                }
+                            }
+                            other => panic!("expected UpdatingClause::Set, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Updating body, got {other:?}"),
+                }
+            }
+            _ => panic!("expected SinglePart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}
+
+/// Unaffected: `SET n.prop = 1` (bare variable target, no parens) — must
+/// still parse as `SetItem::Property` with a bare `Variable` base (not
+/// wrapped in `Parenthesized`).
+///
+/// Unit: `parse()` / AST `SetItem`
+/// Precondition: `MATCH (n) SET n.prop = 1;`.
+/// Expectation: `SetItem::Property` whose `property` base is
+/// `Expression::Variable(n)` directly.
+#[test]
+fn test_set_bare_variable_target_unaffected() {
+    use decypher::ast::clause::SetItem;
+    use decypher::ast::expr::Expression;
+    use decypher::ast::query::{SingleQueryKind, UpdatingClause};
+
+    let query = parse("MATCH (n) SET n.prop = 1;").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            SingleQueryKind::SinglePart(spq) => match &spq.body {
+                SinglePartBody::Updating { updating, .. } => match &updating[0] {
+                    UpdatingClause::Set(set) => match &set.items[0] {
+                        SetItem::Property { property, .. } => match property {
+                            Expression::PropertyLookup { base, .. } => {
+                                check!(
+                                    matches!(base.as_ref(), Expression::Variable(v) if v.name.name == "n")
+                                );
+                            }
+                            other => panic!("expected PropertyLookup, got {other:?}"),
+                        },
+                        other => panic!("expected SetItem::Property, got {other:?}"),
+                    },
+                    other => panic!("expected UpdatingClause::Set, got {other:?}"),
+                },
+                other => panic!("expected Updating body, got {other:?}"),
+            },
+            _ => panic!("expected SinglePart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}

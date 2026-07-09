@@ -294,8 +294,18 @@ fn build_single_query_from_clauses(clauses: Vec<Clause>) -> Result<ast_c::Single
             }
         }
 
-        let final_part = final_part
-            .ok_or_else(|| internal("multi-part query missing final part", Span::new(0, 0)))?;
+        // openCypher allows a multi-part query to end in an updating-clause
+        // sequence with no trailing RETURN (e.g. `MATCH (a) WITH a CREATE
+        // (a)-[:R]->()`). If no RETURN/FINISH/final-WITH set `final_part`
+        // above, fall back to whatever reading/updating clauses trailed the
+        // last `WITH` — mirrors `build_subquery_single_query_from_clauses`.
+        let final_part = final_part.unwrap_or(ast_c::SinglePartQuery {
+            reading_clauses: std::mem::take(&mut reading),
+            body: ast_c::SinglePartBody::Updating {
+                updating,
+                return_clause: None,
+            },
+        });
 
         Ok(ast_c::SingleQuery {
             kind: ast_c::SingleQueryKind::MultiPart(ast_c::MultiPartQuery { parts, final_part }),
