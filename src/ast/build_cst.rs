@@ -1808,7 +1808,14 @@ fn build_filter_expression(fe: FilterExpression) -> Result<ast_c::Expression> {
 
 fn build_exists_subquery(es: ExistsSubquery) -> Result<ast_c::Expression> {
     let sp = span_of(es.syntax());
-    if es.clauses().next().is_some() {
+    // `EXISTS { <pattern> WHERE <expr> }` parses to NODE_PATTERN /
+    // PATTERN_ELEMENT_CHAIN children plus a WHERE_CLAUSE — and WHERE_CLAUSE
+    // casts as a `Clause`, so a bare any-clause check would misroute the
+    // pattern form into the regular-query path (yielding an empty body that
+    // silently drops the braces' content). Only a real query clause (MATCH,
+    // RETURN, …) selects the regular-query form; the pattern's WHERE is
+    // picked up by `es.where_clause()` below.
+    if es.clauses().any(|c| !matches!(c, Clause::Where(_))) {
         return Ok(ast_c::Expression::Exists(Box::new(
             ast_c::ExistsExpression {
                 inner: Box::new(ast_c::ExistsInner::RegularQuery(Box::new(

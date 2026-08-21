@@ -1386,3 +1386,97 @@ fn test_create_set_after_with_before_return() {
         _ => panic!("expected SingleQuery"),
     }
 }
+
+// ── EXISTS { pattern WHERE … } ──────────────────────────────────────────
+//
+// `EXISTS { <pattern> WHERE <expr> }` parses to pattern children plus a
+// WHERE_CLAUSE — and WHERE_CLAUSE casts as a `Clause`, so the builder's
+// bare any-clause check misrouted the pattern form into the regular-query
+// path, producing a `RegularQuery` with an EMPTY `Updating` body (the
+// braces' content silently dropped).
+
+/// `EXISTS { (n)-[:R]->(m) WHERE m.x > 1 }` — the pattern form with a WHERE
+/// — must keep both the pattern and the predicate.
+///
+/// Unit: `parse()` / AST `ExistsInner::Pattern`
+/// Precondition: `MATCH (n) WHERE EXISTS { (n)-[:R]->(m) WHERE m.x > 1 } RETURN n;`.
+/// Expectation: the outer WHERE is `Exists` with `Pattern(p, Some(_))`,
+/// where `p` has one part whose path has one relationship chain.
+#[test]
+fn test_exists_pattern_with_where_preserved() {
+    use decypher::ast::expr::{ExistsInner, Expression};
+    use decypher::ast::pattern::PatternElement;
+
+    let query = parse("MATCH (n) WHERE EXISTS { (n)-[:R]->(m) WHERE m.x > 1 } RETURN n;").unwrap();
+    match match_where_clause(&query) {
+        Expression::Exists(e) => match e.inner.as_ref() {
+            ExistsInner::Pattern(p, where_clause) => {
+                check!(p.parts.len() == 1);
+                match &p.parts[0].anonymous.element {
+                    PatternElement::Path { start, chains } => {
+                        check!(start.variable.as_ref().unwrap().name.name == "n");
+                        check!(chains.len() == 1);
+                    }
+                    other => panic!("expected Path element, got {other:?}"),
+                }
+                check!(where_clause.is_some());
+            }
+            other => panic!("expected ExistsInner::Pattern, got {other:?}"),
+        },
+        other => panic!("expected Exists expression, got {other:?}"),
+    }
+}
+
+/// Unaffected: `EXISTS { (n)-[:R]->(m) }` without WHERE stays the pattern
+/// form with no predicate.
+///
+/// Unit: `parse()` / AST `ExistsInner::Pattern`
+/// Precondition: `MATCH (n) WHERE EXISTS { (n)-[:R]->(m) } RETURN n;`.
+/// Expectation: `Exists` with `Pattern(_, None)`.
+#[test]
+fn test_exists_pattern_without_where_unaffected() {
+    use decypher::ast::expr::{ExistsInner, Expression};
+
+    let query = parse("MATCH (n) WHERE EXISTS { (n)-[:R]->(m) } RETURN n;").unwrap();
+    match match_where_clause(&query) {
+        Expression::Exists(e) => match e.inner.as_ref() {
+            ExistsInner::Pattern(p, where_clause) => {
+                check!(p.parts.len() == 1);
+                check!(where_clause.is_none());
+            }
+            other => panic!("expected ExistsInner::Pattern, got {other:?}"),
+        },
+        other => panic!("expected Exists expression, got {other:?}"),
+    }
+}
+
+/// Unaffected: `EXISTS { MATCH … WHERE … RETURN … }` — a real inner query —
+/// still takes the regular-query form, with its clauses intact.
+///
+/// Unit: `parse()` / AST `ExistsInner::RegularQuery`
+/// Precondition: `MATCH (n) WHERE EXISTS { MATCH (n)-->(m) WHERE m.x > 1 RETURN m } RETURN n;`.
+/// Expectation: `Exists` with `RegularQuery` whose single query is a
+/// `SinglePart` with one MATCH reading clause and a `Return` body.
+#[test]
+fn test_exists_regular_query_unaffected() {
+    use decypher::ast::expr::{ExistsInner, Expression};
+    use decypher::ast::query::{ReadingClause, SingleQueryKind};
+
+    let query =
+        parse("MATCH (n) WHERE EXISTS { MATCH (n)-->(m) WHERE m.x > 1 RETURN m } RETURN n;")
+            .unwrap();
+    match match_where_clause(&query) {
+        Expression::Exists(e) => match e.inner.as_ref() {
+            ExistsInner::RegularQuery(rq) => match &rq.single_query.kind {
+                SingleQueryKind::SinglePart(spq) => {
+                    check!(spq.reading_clauses.len() == 1);
+                    check!(matches!(spq.reading_clauses[0], ReadingClause::Match(_)));
+                    check!(matches!(spq.body, SinglePartBody::Return(_)));
+                }
+                _ => panic!("expected SinglePart inner query"),
+            },
+            other => panic!("expected ExistsInner::RegularQuery, got {other:?}"),
+        },
+        other => panic!("expected Exists expression, got {other:?}"),
+    }
+}
