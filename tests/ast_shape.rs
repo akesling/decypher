@@ -1315,3 +1315,74 @@ fn test_standalone_call_keeps_arguments() {
         other => panic!("expected Standalone call, got {other:?}"),
     }
 }
+
+// ── Updating clauses between WITH and RETURN ────────────────────────────
+//
+// In a multi-part query's FINAL part, updating clauses that preceded the
+// RETURN were dropped: the builder's `RETURN` arm emitted a bare `Return`
+// body without draining the pending updating-clause list, so
+// `MATCH … WITH … MERGE … RETURN …` parsed as a plain read.
+
+/// `MATCH … WITH … MERGE … RETURN …` — a MERGE in the final part of a
+/// multi-part query — must land in an `Updating` body carrying the RETURN,
+/// not vanish.
+///
+/// Unit: `parse()` / AST `MultiPartQuery.final_part`
+/// Precondition: `MATCH (a) WITH a MERGE (b:B) RETURN b;`.
+/// Expectation: final part has `Updating` body with one `Merge` and
+/// `return_clause.is_some()`.
+#[test]
+fn test_merge_after_with_before_return() {
+    use decypher::ast::query::{SingleQueryKind, UpdatingClause};
+
+    let query = parse("MATCH (a) WITH a MERGE (b:B) RETURN b;").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            SingleQueryKind::MultiPart(mpq) => match &mpq.final_part.body {
+                SinglePartBody::Updating {
+                    updating,
+                    return_clause,
+                } => {
+                    check!(updating.len() == 1);
+                    check!(matches!(updating[0], UpdatingClause::Merge(_)));
+                    check!(return_clause.is_some());
+                }
+                other => panic!("expected Updating body, got {other:?}"),
+            },
+            _ => panic!("expected MultiPart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}
+
+/// `MATCH … WITH … CREATE … SET … RETURN …` — several updating clauses in
+/// the final part — must all be kept, in order, alongside the RETURN.
+///
+/// Unit: `parse()` / AST `MultiPartQuery.final_part`
+/// Precondition: `MATCH (a) WITH a CREATE (b) SET b.x = 1 RETURN b;`.
+/// Expectation: final part has `Updating` body with `[Create, Set]` and
+/// `return_clause.is_some()`.
+#[test]
+fn test_create_set_after_with_before_return() {
+    use decypher::ast::query::{SingleQueryKind, UpdatingClause};
+
+    let query = parse("MATCH (a) WITH a CREATE (b) SET b.x = 1 RETURN b;").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            SingleQueryKind::MultiPart(mpq) => match &mpq.final_part.body {
+                SinglePartBody::Updating {
+                    updating,
+                    return_clause,
+                } => {
+                    check!(updating.len() == 2);
+                    check!(matches!(updating[0], UpdatingClause::Create(_)));
+                    check!(matches!(updating[1], UpdatingClause::Set(_)));
+                    check!(return_clause.is_some());
+                }
+                other => panic!("expected Updating body, got {other:?}"),
+            },
+            _ => panic!("expected MultiPart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}

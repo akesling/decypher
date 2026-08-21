@@ -279,9 +279,21 @@ fn build_single_query_from_clauses(clauses: Vec<Clause>) -> Result<ast_c::Single
                 }
                 Clause::Return(r) => {
                     let ret = build_return(r)?;
+                    // Updating clauses pending in this final part (e.g.
+                    // `… WITH a MERGE (b) RETURN b`) terminate in an
+                    // Updating body carrying the RETURN — not a bare Return
+                    // body that would silently drop them.
+                    let body = if updating.is_empty() {
+                        ast_c::SinglePartBody::Return(ret)
+                    } else {
+                        ast_c::SinglePartBody::Updating {
+                            updating: std::mem::take(&mut updating),
+                            return_clause: Some(ret),
+                        }
+                    };
                     final_part = Some(ast_c::SinglePartQuery {
                         reading_clauses: std::mem::take(&mut reading),
-                        body: ast_c::SinglePartBody::Return(ret),
+                        body,
                     });
                 }
                 Clause::Finish(f) => {
@@ -292,17 +304,26 @@ fn build_single_query_from_clauses(clauses: Vec<Clause>) -> Result<ast_c::Single
                 }
                 Clause::With(w) => {
                     let wc = build_with(w)?;
+                    let ret = ast_c::Return {
+                        distinct: wc.distinct,
+                        star: wc.star,
+                        items: wc.items,
+                        order: wc.order,
+                        skip: wc.skip,
+                        limit: wc.limit,
+                        span: wc.span,
+                    };
+                    let body = if updating.is_empty() {
+                        ast_c::SinglePartBody::Return(ret)
+                    } else {
+                        ast_c::SinglePartBody::Updating {
+                            updating: std::mem::take(&mut updating),
+                            return_clause: Some(ret),
+                        }
+                    };
                     final_part = Some(ast_c::SinglePartQuery {
                         reading_clauses: std::mem::take(&mut reading),
-                        body: ast_c::SinglePartBody::Return(ast_c::Return {
-                            distinct: wc.distinct,
-                            star: wc.star,
-                            items: wc.items,
-                            order: wc.order,
-                            skip: wc.skip,
-                            limit: wc.limit,
-                            span: wc.span,
-                        }),
+                        body,
                     });
                 }
                 Clause::StandaloneCall(c) => reading.push(ast_c::ReadingClause::InQueryCall(
@@ -1946,7 +1967,12 @@ fn build_subquery_single_query_from_clauses(clauses: Vec<Clause>) -> Result<ast_
             }
         }
 
-        let body = if let Some(ret) = ret {
+        let body = if !updating.is_empty() {
+            ast_c::SinglePartBody::Updating {
+                updating,
+                return_clause: ret,
+            }
+        } else if let Some(ret) = ret {
             ast_c::SinglePartBody::Return(ret)
         } else {
             ast_c::SinglePartBody::Updating {
@@ -1997,9 +2023,21 @@ fn build_subquery_single_query_from_clauses(clauses: Vec<Clause>) -> Result<ast_
                     updating.push(ast_c::UpdatingClause::Foreach(build_foreach(f)?))
                 }
                 Clause::Return(r) => {
+                    let ret = build_return(r)?;
+                    // Updating clauses pending in this final part terminate in
+                    // an Updating body carrying the RETURN — not a bare Return
+                    // body that would silently drop them.
+                    let body = if updating.is_empty() {
+                        ast_c::SinglePartBody::Return(ret)
+                    } else {
+                        ast_c::SinglePartBody::Updating {
+                            updating: std::mem::take(&mut updating),
+                            return_clause: Some(ret),
+                        }
+                    };
                     final_part = Some(ast_c::SinglePartQuery {
                         reading_clauses: std::mem::take(&mut reading),
-                        body: ast_c::SinglePartBody::Return(build_return(r)?),
+                        body,
                     });
                 }
                 Clause::Finish(f) => {
@@ -2010,17 +2048,26 @@ fn build_subquery_single_query_from_clauses(clauses: Vec<Clause>) -> Result<ast_
                 }
                 Clause::With(w) => {
                     let wc = build_with(w)?;
+                    let ret = ast_c::Return {
+                        distinct: wc.distinct,
+                        star: wc.star,
+                        items: wc.items,
+                        order: wc.order,
+                        skip: wc.skip,
+                        limit: wc.limit,
+                        span: wc.span,
+                    };
+                    let body = if updating.is_empty() {
+                        ast_c::SinglePartBody::Return(ret)
+                    } else {
+                        ast_c::SinglePartBody::Updating {
+                            updating: std::mem::take(&mut updating),
+                            return_clause: Some(ret),
+                        }
+                    };
                     final_part = Some(ast_c::SinglePartQuery {
                         reading_clauses: std::mem::take(&mut reading),
-                        body: ast_c::SinglePartBody::Return(ast_c::Return {
-                            distinct: wc.distinct,
-                            star: wc.star,
-                            items: wc.items,
-                            order: wc.order,
-                            skip: wc.skip,
-                            limit: wc.limit,
-                            span: wc.span,
-                        }),
+                        body,
                     });
                 }
                 Clause::StandaloneCall(c) => reading.push(ast_c::ReadingClause::InQueryCall(
