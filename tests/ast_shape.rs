@@ -1194,3 +1194,124 @@ fn test_set_bare_variable_target_unaffected() {
         _ => panic!("expected SingleQuery"),
     }
 }
+
+// ── In-query CALL as a reading clause ───────────────────────────────────
+//
+// The grammar records every procedure `CALL` as a `STANDALONE_CALL` CST
+// node; whether it is openCypher's `StandaloneCall` (the statement's only
+// clause) or an `InQueryCall` (embedded in a larger query) is positional.
+// Previously a mid-query CALL fell into a catch-all `=> {}` arm of the AST
+// builder and vanished (`MATCH (n) CALL p() YIELD a RETURN a` parsed as a
+// bare `MATCH … RETURN a`), and even standalone calls dropped their
+// argument expressions.
+
+/// `MATCH … CALL proc(args) YIELD … RETURN …` — an in-query procedure call —
+/// must surface as a `ReadingClause::InQueryCall` with the procedure name,
+/// arguments, and YIELD items intact.
+///
+/// Unit: `parse()` / AST `ReadingClause::InQueryCall`
+/// Precondition: `MATCH (n) CALL test.proc(n.x, 1) YIELD out1, out2 AS o RETURN o;`.
+/// Expectation: two reading clauses, the second an `InQueryCall` whose
+/// invocation is named `test.proc` with 2 arguments and whose YIELD has two
+/// items (the second aliased); the body is `Return`.
+#[test]
+fn test_in_query_call_after_match() {
+    use decypher::ast::query::{ReadingClause, SingleQueryKind};
+
+    let query = parse("MATCH (n) CALL test.proc(n.x, 1) YIELD out1, out2 AS o RETURN o;").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            SingleQueryKind::SinglePart(spq) => {
+                check!(spq.reading_clauses.len() == 2);
+                match &spq.reading_clauses[1] {
+                    ReadingClause::InQueryCall(c) => {
+                        let names: Vec<_> =
+                            c.call.name.name.iter().map(|s| s.name.as_str()).collect();
+                        check!(names == ["test", "proc"]);
+                        check!(c.call.name.arguments.len() == 2);
+                        let yi = c.yield_items.as_ref().expect("expected YIELD items");
+                        check!(yi.items.len() == 2);
+                        check!(yi.items[0].procedure_field.name == "out1");
+                        check!(yi.items[1].procedure_field.name == "out2");
+                        check!(yi.items[1].alias.is_some());
+                    }
+                    other => panic!("expected InQueryCall, got {other:?}"),
+                }
+                check!(matches!(spq.body, SinglePartBody::Return(_)));
+            }
+            _ => panic!("expected SinglePart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}
+
+/// `MATCH … CALL proc(arg)` with no YIELD and no RETURN — a terminal void
+/// procedure call — must parse (openCypher allows a query to end in a CALL)
+/// with the call as a reading clause and an empty updating body.
+///
+/// Unit: `parse()` / AST `ReadingClause::InQueryCall`
+/// Precondition: `MATCH (n) CALL test.sideEffect(n);`.
+/// Expectation: two reading clauses, the second an `InQueryCall` with no
+/// YIELD; body is `Updating` with no clauses and no RETURN.
+#[test]
+fn test_in_query_call_no_yield_terminal() {
+    use decypher::ast::query::{ReadingClause, SingleQueryKind};
+
+    let query = parse("MATCH (n) CALL test.sideEffect(n);").unwrap();
+    match &query.statements[0] {
+        QueryBody::SingleQuery(sq) => match &sq.kind {
+            SingleQueryKind::SinglePart(spq) => {
+                check!(spq.reading_clauses.len() == 2);
+                match &spq.reading_clauses[1] {
+                    ReadingClause::InQueryCall(c) => {
+                        check!(c.call.name.arguments.len() == 1);
+                        check!(c.yield_items.is_none());
+                    }
+                    other => panic!("expected InQueryCall, got {other:?}"),
+                }
+                match &spq.body {
+                    SinglePartBody::Updating {
+                        updating,
+                        return_clause,
+                    } => {
+                        check!(updating.is_empty());
+                        check!(return_clause.is_none());
+                    }
+                    other => panic!("expected empty Updating body, got {other:?}"),
+                }
+            }
+            _ => panic!("expected SinglePart query"),
+        },
+        _ => panic!("expected SingleQuery"),
+    }
+}
+
+/// In-query `YIELD *` — legal only in a standalone call per the openCypher
+/// grammar — must be rejected rather than silently dropped.
+///
+/// Unit: `parse()` error path
+/// Precondition: `MATCH (n) CALL test.proc() YIELD * RETURN n;`.
+/// Expectation: `parse` returns an error.
+#[test]
+fn test_in_query_call_yield_star_rejected() {
+    check!(parse("MATCH (n) CALL test.proc() YIELD * RETURN n;").is_err());
+}
+
+/// Unaffected: a sole `CALL proc(args)` statement stays a standalone call —
+/// and now keeps its argument expressions.
+///
+/// Unit: `parse()` / AST `QueryBody::Standalone`
+/// Precondition: `CALL test.proc(1, 2)`.
+/// Expectation: `QueryBody::Standalone` with name `test.proc` and 2 arguments.
+#[test]
+fn test_standalone_call_keeps_arguments() {
+    let query = parse("CALL test.proc(1, 2)").unwrap();
+    match &query.statements[0] {
+        QueryBody::Standalone(sc) => {
+            let names: Vec<_> = sc.call.name.name.iter().map(|s| s.name.as_str()).collect();
+            check!(names == ["test", "proc"]);
+            check!(sc.call.name.arguments.len() == 2);
+        }
+        other => panic!("expected Standalone call, got {other:?}"),
+    }
+}

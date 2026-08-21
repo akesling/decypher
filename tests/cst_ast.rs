@@ -715,7 +715,10 @@ fn standalone_call_with_yield() {
     let result = parse("MATCH (n) CALL db.labels() YIELD label RETURN label");
     let source = result.tree();
     let call = find_standalone_call(&source).unwrap();
-    check!(call.implicit_invocation().is_some());
+    // `db.labels()` has parens, so it is an EXPLICIT invocation (the implicit
+    // form is the paren-less `CALL db.labels`).
+    let explicit = call.explicit_invocation().unwrap();
+    check!(explicit.procedure_name().is_some());
 }
 
 /// Verify CST shape for: implicit procedure invocation.

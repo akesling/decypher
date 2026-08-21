@@ -2335,17 +2335,21 @@ fn parse_call_clause(p: &mut Parser) {
 }
 
 fn parse_procedure_call(p: &mut Parser) {
-    // Determine if standalone or in-query based on context
-    // For now, parse as standalone call
+    // Standalone vs in-query is a semantic distinction (a standalone call is
+    // the statement's ONLY clause); the CST records every procedure CALL
+    // uniformly as STANDALONE_CALL and the AST builder resolves the position.
+    // The invocation node wraps the name AND the argument parens, so
+    // `StandaloneCall::explicit_invocation()` (a direct-children lookup) and
+    // `ExplicitProcedureInvocation::procedure_name()/arguments()` both work.
     p.start_node(SyntaxKind::STANDALONE_CALL);
     p.bump(); // CALL
     p.skip_trivia();
-    p.start_node(SyntaxKind::IMPLICIT_PROCEDURE_INVOCATION);
+    let invocation = p.checkpoint();
     parse_procedure_name(p);
     p.skip_trivia();
     if p.at(SyntaxKind::L_PAREN) {
         // Explicit: CALL proc(args)
-        p.start_node(SyntaxKind::EXPLICIT_PROCEDURE_INVOCATION);
+        p.start_node_at(invocation, SyntaxKind::EXPLICIT_PROCEDURE_INVOCATION);
         p.bump(); // L_PAREN
         p.skip_trivia();
         // Arguments
@@ -2360,9 +2364,11 @@ fn parse_procedure_call(p: &mut Parser) {
         }
         p.expect(SyntaxKind::R_PAREN);
         p.builder.finish_node();
+    } else {
+        // Implicit — no parens, just the procedure name
+        p.start_node_at(invocation, SyntaxKind::IMPLICIT_PROCEDURE_INVOCATION);
+        p.builder.finish_node();
     }
-    // else: Implicit — no parens, just the procedure name
-    p.builder.finish_node();
     p.skip_trivia();
     // Optional YIELD
     if p.at(SyntaxKind::KW_YIELD) {

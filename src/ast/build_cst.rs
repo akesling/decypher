@@ -203,9 +203,12 @@ fn build_single_query_from_clauses(clauses: Vec<Clause>) -> Result<ast_c::Single
                         }),
                     });
                 }
+                Clause::StandaloneCall(c) => reading.push(ast_c::ReadingClause::InQueryCall(
+                    build_in_query_call_from_standalone(c)?,
+                )),
                 Clause::With(_) => {}
                 Clause::Where(_) => {}
-                Clause::Show(_) | Clause::Use(_) | Clause::StandaloneCall(_) => {}
+                Clause::Show(_) | Clause::Use(_) => {}
             }
         }
 
@@ -214,10 +217,23 @@ fn build_single_query_from_clauses(clauses: Vec<Clause>) -> Result<ast_c::Single
                 updating,
                 return_clause: ret,
             }
+        } else if let Some(ret) = ret {
+            ast_c::SinglePartBody::Return(ret)
+        } else if matches!(
+            reading.last(),
+            Some(ast_c::ReadingClause::InQueryCall(_) | ast_c::ReadingClause::CallSubquery(_))
+        ) {
+            // openCypher allows a query to END in a (void) procedure CALL or
+            // CALL { } subquery with no trailing RETURN.
+            ast_c::SinglePartBody::Updating {
+                updating,
+                return_clause: None,
+            }
         } else {
-            ast_c::SinglePartBody::Return(ret.ok_or_else(|| {
-                internal("single-part query must end with RETURN", Span::new(0, 0))
-            })?)
+            return Err(internal(
+                "single-part query must end with RETURN",
+                Span::new(0, 0),
+            ));
         };
 
         Ok(ast_c::SingleQuery {
@@ -289,8 +305,11 @@ fn build_single_query_from_clauses(clauses: Vec<Clause>) -> Result<ast_c::Single
                         }),
                     });
                 }
+                Clause::StandaloneCall(c) => reading.push(ast_c::ReadingClause::InQueryCall(
+                    build_in_query_call_from_standalone(c)?,
+                )),
                 Clause::Where(_) => {}
-                Clause::Show(_) | Clause::Use(_) | Clause::StandaloneCall(_) => {}
+                Clause::Show(_) | Clause::Use(_) => {}
             }
         }
 
@@ -1920,11 +1939,10 @@ fn build_subquery_single_query_from_clauses(clauses: Vec<Clause>) -> Result<ast_
                         }),
                     });
                 }
-                Clause::With(_)
-                | Clause::Where(_)
-                | Clause::Show(_)
-                | Clause::Use(_)
-                | Clause::StandaloneCall(_) => {}
+                Clause::StandaloneCall(c) => reading.push(ast_c::ReadingClause::InQueryCall(
+                    build_in_query_call_from_standalone(c)?,
+                )),
+                Clause::With(_) | Clause::Where(_) | Clause::Show(_) | Clause::Use(_) => {}
             }
         }
 
@@ -2005,8 +2023,10 @@ fn build_subquery_single_query_from_clauses(clauses: Vec<Clause>) -> Result<ast_
                         }),
                     });
                 }
-                Clause::Where(_) | Clause::Show(_) | Clause::Use(_) | Clause::StandaloneCall(_) => {
-                }
+                Clause::StandaloneCall(c) => reading.push(ast_c::ReadingClause::InQueryCall(
+                    build_in_query_call_from_standalone(c)?,
+                )),
+                Clause::Where(_) | Clause::Show(_) | Clause::Use(_) => {}
             }
         }
 
@@ -2111,12 +2131,13 @@ fn build_explicit_procedure_invocation(
     e: ExplicitProcedureInvocation,
 ) -> Result<ast_c::ProcedureInvocation> {
     let sp = span_of(e.syntax());
-    let name = if let Some(pn) = e.procedure_name() {
+    let mut name = if let Some(pn) = e.procedure_name() {
         build_procedure_name(pn)?
     } else {
         return Err(internal("missing proc name", sp));
     };
-    let _args: Result<Vec<_>> = e.arguments().map(build_expression).collect();
+    let args: Result<Vec<_>> = e.arguments().map(build_expression).collect();
+    name.arguments = args?;
     Ok(ast_c::ProcedureInvocation { name, span: sp })
 }
 
@@ -2187,6 +2208,30 @@ fn build_in_query_call(c: InQueryCall) -> Result<ast_c::InQueryCall> {
         },
         yield_items,
         span: sp,
+    })
+}
+
+/// Adapt a CST `STANDALONE_CALL` that appears alongside other clauses into an
+/// in-query `CALL` reading clause.
+///
+/// The grammar records every procedure `CALL` as `STANDALONE_CALL`; whether it
+/// is openCypher's `StandaloneCall` (the statement's only clause) or an
+/// `InQueryCall` (embedded in a larger query) is positional, and only the AST
+/// builder sees the position. `YIELD *` is only valid in a standalone call, so
+/// it is rejected here.
+fn build_in_query_call_from_standalone(c: StandaloneCall) -> Result<ast_c::InQueryCall> {
+    let sc = build_standalone_call(c)?;
+    let yield_items = match sc.yield_items {
+        None => None,
+        Some(ast_c::YieldSpec::Items(items)) => Some(items),
+        Some(ast_c::YieldSpec::Star { span }) => {
+            return Err(internal("YIELD * is only valid in a standalone CALL", span));
+        }
+    };
+    Ok(ast_c::InQueryCall {
+        call: sc.call,
+        yield_items,
+        span: sc.span,
     })
 }
 

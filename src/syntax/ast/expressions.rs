@@ -1704,10 +1704,41 @@ impl ExplicitProcedureInvocation {
     }
 
     pub fn arguments(&self) -> impl Iterator<Item = Expression> {
-        self.0
-            .children()
-            .filter(|n| n.kind() != SyntaxKind::PROCEDURE_NAME && n.kind() != SyntaxKind::NAMESPACE)
-            .filter_map(Expression::cast)
+        // The flat CST can expose a compound argument as multiple sibling
+        // expression nodes (e.g. `n`, then `n.x`). Segment on COMMA and keep
+        // the latest expression in each segment so each argument is the final
+        // composed expression — same recovery as
+        // `FunctionInvocation::arguments`.
+        let mut args = Vec::new();
+        let mut current = None;
+
+        for child in self.0.children_with_tokens() {
+            if let Some(t) = child.as_token() {
+                if t.kind() == SyntaxKind::COMMA
+                    && let Some(expr) = current.take()
+                {
+                    args.push(expr);
+                }
+                continue;
+            }
+            if let Some(node) = child.as_node() {
+                if matches!(
+                    node.kind(),
+                    SyntaxKind::PROCEDURE_NAME | SyntaxKind::NAMESPACE
+                ) {
+                    continue;
+                }
+                if let Some(expr) = Expression::cast(node.clone()) {
+                    current = Some(expr);
+                }
+            }
+        }
+
+        if let Some(expr) = current {
+            args.push(expr);
+        }
+
+        args.into_iter()
     }
 }
 
