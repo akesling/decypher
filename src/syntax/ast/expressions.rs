@@ -1233,34 +1233,34 @@ impl AstNode for PatternComprehension {
 }
 
 impl PatternComprehension {
+    /// The optional path variable bound by `[p = … | …]`, which precedes the
+    /// pattern.
     pub fn variable(&self) -> Option<Variable> {
         self.0
             .children()
-            .take_while(|n| {
-                n.kind() != SyntaxKind::RELATIONSHIPS_PATTERN
-                    && n.kind() != SyntaxKind::NODE_PATTERN
-                    && n.kind() != SyntaxKind::PATTERN_ELEMENT_CHAIN
-            })
+            .take_while(|n| n.kind() != SyntaxKind::RELATIONSHIPS_PATTERN)
             .find_map(Variable::cast)
     }
 
-    pub fn pattern(&self) -> Option<SyntaxNode> {
-        self.0.children().find(|n| {
-            matches!(
-                n.kind(),
-                SyntaxKind::RELATIONSHIPS_PATTERN
-                    | SyntaxKind::NODE_PATTERN
-                    | SyntaxKind::PATTERN_ELEMENT_CHAIN
-            )
-        })
+    /// The pattern being comprehended — the same `RELATIONSHIPS_PATTERN` node
+    /// shape a bare pattern-predicate atom produces.
+    pub fn pattern(&self) -> Option<RelationshipsPattern> {
+        child(&self.0)
     }
 
     pub fn where_clause(&self) -> Option<super::clauses::WhereClause> {
         child(&self.0)
     }
 
+    /// The `| map` expression. Only children after the `|` are considered,
+    /// since the pattern is itself an expression-castable child.
     pub fn body(&self) -> Option<Expression> {
-        self.0.children().filter_map(Expression::cast).last()
+        self.0
+            .children_with_tokens()
+            .skip_while(|el| el.as_token().map(|t| t.kind()) != Some(SyntaxKind::PIPE))
+            .filter_map(|el| el.into_node())
+            .filter_map(Expression::cast)
+            .last()
     }
 }
 

@@ -153,3 +153,18 @@ fn redeclare_in_pattern_chain() {
         ),
     }
 }
+
+/// A pattern comprehension's pattern binds its own variables, so neither its
+/// path variable nor a node the map projects is a diagnostic: `p` is bound
+/// once (not also as the start node) and `b` resolves from the pattern.
+///
+/// Unit: `sema::analyze()`
+/// Precondition: `MATCH (a) RETURN [p = (a)-[:T]->(b) | b.x] AS ps` — `p` is
+/// the path variable and `b` is bound by the pattern.
+/// Expectation: Analysis returns `Ok`.
+#[test]
+fn pattern_comprehension_binds_its_pattern() {
+    let query = parse("MATCH (a) RETURN [p = (a)-[:T]->(b) | b.x] AS ps").expect("should parse");
+    let result = analyze(&query);
+    assert!(result.is_ok(), "analysis failed: {:?}", result);
+}

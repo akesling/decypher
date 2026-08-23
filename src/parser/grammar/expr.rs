@@ -732,18 +732,7 @@ fn parse_atom(p: &mut Parser) {
             // Peeking: after ( should be optional var, optional :Label, optional {props}, then )
             // followed by - or < for chain start
             if looks_like_bare_relationships_pattern(p) {
-                p.start_node(SyntaxKind::RELATIONSHIPS_PATTERN);
-                parse_node_pattern_for_atom(p);
-                p.skip_trivia();
-                while is_relationship_chain_start(p) {
-                    p.start_node(SyntaxKind::PATTERN_ELEMENT_CHAIN);
-                    parse_relationship_pattern(p);
-                    p.skip_trivia();
-                    parse_node_pattern_for_atom(p);
-                    p.builder.finish_node();
-                    p.skip_trivia();
-                }
-                p.builder.finish_node();
+                parse_relationships_pattern(p);
             } else {
                 p.start_node(SyntaxKind::PARENTHESIZED_EXPR);
                 p.bump();
@@ -1323,7 +1312,7 @@ fn parse_bracket_expr(p: &mut Parser) {
             }
         }
         // RelationshipsPattern
-        parse_relationships_pattern_body(p);
+        parse_relationships_pattern(p);
         p.skip_trivia();
         // Optional WHERE
         if p.at(SyntaxKind::KW_WHERE) {
@@ -1375,8 +1364,15 @@ fn parse_bracket_expr(p: &mut Parser) {
     }
 }
 
-fn parse_relationships_pattern_body(p: &mut Parser) {
-    // Parse: NodePattern (PatternElementChain)+
+/// Parse a `RelationshipsPattern` — `NodePattern (PatternElementChain)*` —
+/// into a single `RELATIONSHIPS_PATTERN` node.
+///
+/// Both places a pattern appears in expression position use this: the bare
+/// pattern-predicate atom (`WHERE (n)-[:REL]->()`) and the pattern
+/// comprehension's pattern (`[(a)-[:T]->(b) | b.x]`), so the two produce the
+/// same subtree shape and share one typed-AST builder.
+fn parse_relationships_pattern(p: &mut Parser) {
+    p.start_node(SyntaxKind::RELATIONSHIPS_PATTERN);
     parse_node_pattern_for_atom(p);
     p.skip_trivia();
     while is_relationship_chain_start(p) {
@@ -1387,6 +1383,7 @@ fn parse_relationships_pattern_body(p: &mut Parser) {
         p.builder.finish_node();
         p.skip_trivia();
     }
+    p.builder.finish_node();
 }
 
 fn parse_filter_expression(p: &mut Parser) {

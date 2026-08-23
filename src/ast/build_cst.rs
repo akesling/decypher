@@ -1747,7 +1747,11 @@ fn build_list_comprehension(lc: ListComprehension) -> Result<ast_c::Expression> 
 fn build_pattern_comprehension(pc: PatternComprehension) -> Result<ast_c::Expression> {
     let sp = span_of(pc.syntax());
     let variable = pc.variable().map(build_variable);
-    let _pat = pc.pattern();
+    let pattern = pc
+        .pattern()
+        .map(build_relationships_pattern)
+        .transpose()?
+        .ok_or_else(|| internal("missing pattern in pattern comp", sp))?;
     let where_clause = pc
         .where_clause()
         .and_then(|w| w.expr())
@@ -1758,20 +1762,10 @@ fn build_pattern_comprehension(pc: PatternComprehension) -> Result<ast_c::Expres
         .map(build_expression)
         .transpose()?
         .ok_or_else(|| internal("missing body in pattern comp", sp))?;
-    let placeholder = ast_c::RelationshipsPattern {
-        start: ast_c::NodePattern {
-            variable: variable.clone(),
-            labels: Vec::new(),
-            properties: None,
-            span: sp,
-        },
-        chains: Vec::new(),
-        span: sp,
-    };
     Ok(ast_c::Expression::PatternComprehension(Box::new(
         ast_c::PatternComprehension {
             variable,
-            pattern: placeholder,
+            pattern,
             where_clause,
             map,
             span: sp,

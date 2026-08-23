@@ -1480,3 +1480,189 @@ fn test_exists_regular_query_unaffected() {
         other => panic!("expected Exists expression, got {other:?}"),
     }
 }
+
+// ── Pattern comprehensions ──────────────────────────────────────────────
+//
+// `[<pattern> WHERE <expr> | <map>]` parses its pattern into the same
+// `RELATIONSHIPS_PATTERN` node a bare pattern predicate produces, so the
+// typed AST carries the real path — start node, every relationship chain,
+// types, ranges — rather than a bare-node stand-in.
+
+/// Extract the sole projected expression as a `PatternComprehension`.
+fn first_projection_pattern_comprehension(
+    query: &decypher::ast::Query,
+) -> &decypher::ast::expr::PatternComprehension {
+    match first_projection_expr(query) {
+        decypher::ast::expr::Expression::PatternComprehension(pc) => pc.as_ref(),
+        other => panic!("expected PatternComprehension, got {other:?}"),
+    }
+}
+
+/// The static type name of a chain's relationship, panicking on any other
+/// label-expression form.
+fn chain_type(chain: &decypher::ast::pattern::PatternElementChain) -> &str {
+    match chain
+        .relationship
+        .detail
+        .as_ref()
+        .expect("relationship detail")
+        .types
+        .as_ref()
+        .expect("relationship types")
+    {
+        decypher::ast::pattern::LabelExpression::Static(name) => &name.name,
+        other => panic!("expected a static relationship type, got {other:?}"),
+    }
+}
+
+/// The variable name bound to a chain's end node.
+fn chain_end(chain: &decypher::ast::pattern::PatternElementChain) -> &str {
+    &chain
+        .node
+        .variable
+        .as_ref()
+        .expect("end node variable")
+        .name
+        .name
+}
+
+/// `[(a)-[:T]->(b) | b.x]` must keep the whole matched path: the start node
+/// `a`, one relationship chain typed `T` pointing right, and the end node
+/// `b` — not collapse to a lone node pattern.
+///
+/// Unit: `parse()` / AST `PatternComprehension::pattern`
+/// Precondition: `MATCH (a) RETURN [(a)-[:T]->(b) | b.x];`.
+/// Expectation: `pattern.start.variable == "a"`, `chains.len() == 1`, that
+/// chain is `:T` with `Right` direction and end node `b`, and the map is a
+/// property lookup.
+#[test]
+fn test_pattern_comprehension_keeps_chain() {
+    use decypher::ast::expr::Expression;
+    use decypher::ast::pattern::RelationshipDirection;
+
+    let query = parse("MATCH (a) RETURN [(a)-[:T]->(b) | b.x];").unwrap();
+    let pc = first_projection_pattern_comprehension(&query);
+    check!(pc.variable.is_none());
+    check!(pc.pattern.start.variable.as_ref().unwrap().name.name == "a");
+    check!(pc.pattern.chains.len() == 1);
+    check!(pc.pattern.chains[0].relationship.direction == RelationshipDirection::Right);
+    check!(chain_type(&pc.pattern.chains[0]) == "T");
+    check!(chain_end(&pc.pattern.chains[0]) == "b");
+    check!(matches!(pc.map, Expression::PropertyLookup { .. }));
+}
+
+/// `[(a)-[r:T]->(b) WHERE b.x > 1 | b.name]` must keep the pattern *and*
+/// the WHERE predicate: fixing the pattern must not disturb the filter.
+///
+/// Unit: `parse()` / AST `PatternComprehension::{pattern, where_clause}`
+/// Precondition: `MATCH (a) RETURN [(a)-[r:T]->(b) WHERE b.x > 1 | b.name];`.
+/// Expectation: one chain bound to `r` and typed `T`, and `where_clause` is
+/// a `>` comparison.
+#[test]
+fn test_pattern_comprehension_with_where() {
+    use decypher::ast::expr::{ComparisonOperator, Expression};
+
+    let query = parse("MATCH (a) RETURN [(a)-[r:T]->(b) WHERE b.x > 1 | b.name];").unwrap();
+    let pc = first_projection_pattern_comprehension(&query);
+    check!(pc.pattern.chains.len() == 1);
+    check!(chain_type(&pc.pattern.chains[0]) == "T");
+    let detail = pc.pattern.chains[0].relationship.detail.as_ref().unwrap();
+    check!(detail.variable.as_ref().unwrap().name.name == "r");
+    match pc.where_clause.as_ref().expect("WHERE clause") {
+        Expression::Comparison { operators, .. } => {
+            check!(operators.len() == 1);
+            check!(operators[0].0 == ComparisonOperator::Gt);
+        }
+        other => panic!("expected a comparison in WHERE, got {other:?}"),
+    }
+}
+
+/// `[p = (a)-->(b) | p]` binds the path variable `p` *and* keeps the real
+/// pattern: `p` lives in `PatternComprehension::variable`, while the
+/// pattern's start node is `a` — the path variable must never stand in as
+/// the start node.
+///
+/// Unit: `parse()` / AST `PatternComprehension::{variable, pattern}`
+/// Precondition: `MATCH (a) RETURN [p = (a)-->(b) | p];`.
+/// Expectation: `variable == "p"`, `pattern.start.variable == "a"`, and
+/// `chains.len() == 1`.
+#[test]
+fn test_pattern_comprehension_path_variable() {
+    let query = parse("MATCH (a) RETURN [p = (a)-->(b) | p];").unwrap();
+    let pc = first_projection_pattern_comprehension(&query);
+    check!(pc.variable.as_ref().unwrap().name.name == "p");
+    check!(pc.pattern.start.variable.as_ref().unwrap().name.name == "a");
+    check!(pc.pattern.chains.len() == 1);
+    check!(chain_end(&pc.pattern.chains[0]) == "b");
+}
+
+/// A multi-hop comprehension pattern keeps every chain, in order, with each
+/// chain's own direction and type.
+///
+/// Unit: `parse()` / AST `PatternComprehension::pattern`
+/// Precondition: `MATCH (a) RETURN [(a)-[:T]->(b)<-[:U]-(c) | c];`.
+/// Expectation: two chains — `:T` `Right` to `b`, then `:U` `Left` to `c`.
+#[test]
+fn test_pattern_comprehension_multi_hop() {
+    use decypher::ast::pattern::RelationshipDirection;
+
+    let query = parse("MATCH (a) RETURN [(a)-[:T]->(b)<-[:U]-(c) | c];").unwrap();
+    let pc = first_projection_pattern_comprehension(&query);
+    check!(pc.pattern.start.variable.as_ref().unwrap().name.name == "a");
+    check!(pc.pattern.chains.len() == 2);
+    check!(pc.pattern.chains[0].relationship.direction == RelationshipDirection::Right);
+    check!(chain_type(&pc.pattern.chains[0]) == "T");
+    check!(chain_end(&pc.pattern.chains[0]) == "b");
+    check!(pc.pattern.chains[1].relationship.direction == RelationshipDirection::Left);
+    check!(chain_type(&pc.pattern.chains[1]) == "U");
+    check!(chain_end(&pc.pattern.chains[1]) == "c");
+}
+
+/// A variable-length relationship inside a comprehension keeps its range —
+/// `*1..2` must survive as a `RangeLiteral`, since a consumer must plan a
+/// bounded traversal rather than a single hop.
+///
+/// Unit: `parse()` / AST `RelationshipDetail::range`
+/// Precondition: `MATCH (a) RETURN [(a)-[:T*1..2]->(b) | b];`.
+/// Expectation: the chain's detail has `range == Some(1..2)`.
+#[test]
+fn test_pattern_comprehension_variable_length() {
+    let query = parse("MATCH (a) RETURN [(a)-[:T*1..2]->(b) | b];").unwrap();
+    let pc = first_projection_pattern_comprehension(&query);
+    check!(pc.pattern.chains.len() == 1);
+    let range = pc.pattern.chains[0]
+        .relationship
+        .detail
+        .as_ref()
+        .expect("relationship detail")
+        .range
+        .as_ref()
+        .expect("variable-length range");
+    check!(range.start == Some(1));
+    check!(range.end == Some(2));
+}
+
+/// A comprehension nested in another comprehension's map expression keeps
+/// both patterns: the inner one is reached through the outer's `map`.
+///
+/// Unit: `parse()` / AST `PatternComprehension::map`
+/// Precondition: `MATCH (a) RETURN [(a)-->(b) | [(b)-->(c) | c.x]];`.
+/// Expectation: outer pattern starts at `a` with one chain, and its map is a
+/// `PatternComprehension` starting at `b` with one chain to `c`.
+#[test]
+fn test_pattern_comprehension_nested_in_map() {
+    use decypher::ast::expr::Expression;
+
+    let query = parse("MATCH (a) RETURN [(a)-->(b) | [(b)-->(c) | c.x]];").unwrap();
+    let outer = first_projection_pattern_comprehension(&query);
+    check!(outer.pattern.start.variable.as_ref().unwrap().name.name == "a");
+    check!(outer.pattern.chains.len() == 1);
+    match &outer.map {
+        Expression::PatternComprehension(inner) => {
+            check!(inner.pattern.start.variable.as_ref().unwrap().name.name == "b");
+            check!(inner.pattern.chains.len() == 1);
+            check!(chain_end(&inner.pattern.chains[0]) == "c");
+        }
+        other => panic!("expected a nested PatternComprehension map, got {other:?}"),
+    }
+}
