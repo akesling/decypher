@@ -1666,3 +1666,215 @@ fn test_pattern_comprehension_nested_in_map() {
         other => panic!("expected a nested PatternComprehension map, got {other:?}"),
     }
 }
+
+// ── List comprehensions bound to a contextual keyword ───────────────────
+//
+// A comprehension's binder is an ordinary variable, so it may be spelled
+// with any contextual (non-reserved) keyword — `key`, `type`, `count`, …
+// The `[ … ]` disambiguation therefore recognises those token kinds as a
+// name, not only `IDENT`/`ESCAPED_IDENT`.
+
+/// Extract the sole projected expression as a `ListComprehension`.
+fn first_projection_list_comprehension(
+    query: &decypher::ast::Query,
+) -> &decypher::ast::expr::ListComprehension {
+    match first_projection_expr(query) {
+        decypher::ast::expr::Expression::ListComprehension(lc) => lc.as_ref(),
+        other => panic!("expected ListComprehension, got {other:?}"),
+    }
+}
+
+/// `[key IN keys(r) | key + '->' + r[key]]` — the binder is the contextual
+/// keyword `key`, the collection is a function call, and the map indexes the
+/// relationship by the bound key.
+///
+/// Unit: `parse()` / AST `Expression::ListComprehension`
+/// Precondition: `MATCH ()-[r]->() RETURN [key IN keys(r) | key + '->' + r[key]];`.
+/// Expectation: `variable == "key"`, `collection` is `keys(r)`, `filter` is
+/// `None`, and `map` is an `Add` whose right operand is a `ListIndex`.
+#[test]
+fn test_list_comprehension_keyword_binder_map() {
+    use decypher::ast::expr::{BinaryOperator, Expression};
+
+    let query = parse("MATCH ()-[r]->() RETURN [key IN keys(r) | key + '->' + r[key]];").unwrap();
+    let lc = first_projection_list_comprehension(&query);
+    check!(lc.variable.name.name == "key");
+    match lc.collection.as_ref() {
+        Expression::FunctionCall(fi) => {
+            check!(fi.name.len() == 1);
+            check!(fi.name[0].name == "keys");
+            check!(fi.arguments.len() == 1);
+        }
+        other => panic!("expected a keys(r) collection, got {other:?}"),
+    }
+    check!(lc.filter.is_none());
+    match &lc.map {
+        Some(Expression::BinaryOp { op, rhs, .. }) => {
+            check!(*op == BinaryOperator::Add);
+            match rhs.as_ref() {
+                Expression::ListIndex { list, index, .. } => {
+                    check!(matches!(list.as_ref(), Expression::Variable(v) if v.name.name == "r"));
+                    check!(
+                        matches!(index.as_ref(), Expression::Variable(v) if v.name.name == "key")
+                    );
+                }
+                other => panic!("expected r[key] as the map's right operand, got {other:?}"),
+            }
+        }
+        other => panic!("expected Some(BinaryOp) map, got {other:?}"),
+    }
+}
+
+/// `[key IN keys(r) WHERE key <> 'a']` — a keyword binder with a filter and
+/// no map keeps the predicate and leaves `map` empty.
+///
+/// Unit: `parse()` / AST `Expression::ListComprehension`
+/// Precondition: `MATCH ()-[r]->() RETURN [key IN keys(r) WHERE key <> 'a'];`.
+/// Expectation: `variable == "key"`, `filter` is `Some(Comparison)`, `map` is
+/// `None`.
+#[test]
+fn test_list_comprehension_keyword_binder_where_no_map() {
+    use decypher::ast::expr::{ComparisonOperator, Expression};
+
+    let query = parse("MATCH ()-[r]->() RETURN [key IN keys(r) WHERE key <> 'a'];").unwrap();
+    let lc = first_projection_list_comprehension(&query);
+    check!(lc.variable.name.name == "key");
+    match lc.filter.as_deref() {
+        Some(Expression::Comparison { operators, .. }) => {
+            check!(operators.len() == 1);
+            check!(operators[0].0 == ComparisonOperator::Ne);
+        }
+        other => panic!("expected Some(Comparison) filter, got {other:?}"),
+    }
+    check!(lc.map.is_none());
+}
+
+/// `[key IN keys(r) WHERE key <> 'a' | r[key]]` — a keyword binder carries
+/// filter and map simultaneously, and the map is an index lookup.
+///
+/// Unit: `parse()` / AST `Expression::ListComprehension`
+/// Precondition:
+/// `MATCH ()-[r]->() RETURN [key IN keys(r) WHERE key <> 'a' | r[key]];`.
+/// Expectation: `filter` is `Some(Comparison)` and `map` is `Some(ListIndex)`
+/// over `r` indexed by `key`.
+#[test]
+fn test_list_comprehension_keyword_binder_where_and_map() {
+    use decypher::ast::expr::Expression;
+
+    let query =
+        parse("MATCH ()-[r]->() RETURN [key IN keys(r) WHERE key <> 'a' | r[key]];").unwrap();
+    let lc = first_projection_list_comprehension(&query);
+    check!(lc.variable.name.name == "key");
+    check!(matches!(
+        lc.filter.as_deref(),
+        Some(Expression::Comparison { .. })
+    ));
+    match &lc.map {
+        Some(Expression::ListIndex { list, index, .. }) => {
+            check!(matches!(list.as_ref(), Expression::Variable(v) if v.name.name == "r"));
+            check!(matches!(index.as_ref(), Expression::Variable(v) if v.name.name == "key"));
+        }
+        other => panic!("expected Some(ListIndex) map, got {other:?}"),
+    }
+}
+
+/// `[key IN keys(r)]` — with neither filter nor map, a keyword binder still
+/// produces a comprehension, exactly as an identifier binder does; it must
+/// not degrade into a one-element list literal holding an `IN` predicate.
+///
+/// Unit: `parse()` / AST `Expression::ListComprehension`
+/// Precondition: `MATCH ()-[r]->() RETURN [key IN keys(r)];`.
+/// Expectation: `variable == "key"`, `filter` and `map` are both `None`.
+#[test]
+fn test_list_comprehension_keyword_binder_bare() {
+    let query = parse("MATCH ()-[r]->() RETURN [key IN keys(r)];").unwrap();
+    let lc = first_projection_list_comprehension(&query);
+    check!(lc.variable.name.name == "key");
+    check!(lc.filter.is_none());
+    check!(lc.map.is_none());
+}
+
+/// A comprehension nested in another comprehension's map keeps both binders,
+/// including when the inner one is a contextual keyword.
+///
+/// Unit: `parse()` / AST `ListComprehension::map`
+/// Precondition: `MATCH (n) RETURN [x IN [1,2] | [type IN keys(n) | type]];`.
+/// Expectation: outer binder `x`, and the outer map is a `ListComprehension`
+/// whose binder is `type`.
+#[test]
+fn test_list_comprehension_nested_keyword_binder() {
+    use decypher::ast::expr::Expression;
+
+    let query = parse("MATCH (n) RETURN [x IN [1,2] | [type IN keys(n) | type]];").unwrap();
+    let outer = first_projection_list_comprehension(&query);
+    check!(outer.variable.name.name == "x");
+    match &outer.map {
+        Some(Expression::ListComprehension(inner)) => {
+            check!(inner.variable.name.name == "type");
+            check!(matches!(
+                inner.map.as_ref(),
+                Some(Expression::Variable(v)) if v.name.name == "type"
+            ));
+        }
+        other => panic!("expected a nested ListComprehension map, got {other:?}"),
+    }
+}
+
+/// A pattern comprehension's path variable is a variable too, so it may also
+/// be spelled with a contextual keyword.
+///
+/// Unit: `parse()` / AST `PatternComprehension::{variable, pattern}`
+/// Precondition: `MATCH (a) RETURN [key = (a)-->(b) | key];`.
+/// Expectation: `variable == "key"` and the pattern still starts at `a` with
+/// one chain ending at `b`.
+#[test]
+fn test_pattern_comprehension_keyword_path_variable() {
+    let query = parse("MATCH (a) RETURN [key = (a)-->(b) | key];").unwrap();
+    let pc = first_projection_pattern_comprehension(&query);
+    check!(pc.variable.as_ref().unwrap().name.name == "key");
+    check!(pc.pattern.start.variable.as_ref().unwrap().name.name == "a");
+    check!(pc.pattern.chains.len() == 1);
+    check!(chain_end(&pc.pattern.chains[0]) == "b");
+}
+
+/// A plain list literal is unaffected: `[1, 2, 3]` stays a `Literal::List`
+/// with three elements, and no binder is invented for it.
+///
+/// Unit: `parse()` / AST `Literal::List`
+/// Precondition: `RETURN [1, 2, 3];`.
+/// Expectation: `Literal::List` with `elements.len() == 3`.
+#[test]
+fn test_bare_list_literal_unaffected() {
+    use decypher::ast::expr::{Expression, Literal};
+
+    let query = parse("RETURN [1, 2, 3];").unwrap();
+    match first_projection_expr(&query) {
+        Expression::Literal(Literal::List(list)) => {
+            check!(list.elements.len() == 3);
+        }
+        other => panic!("expected a list literal, got {other:?}"),
+    }
+}
+
+/// A list literal whose elements are *named* with contextual keywords is
+/// still a list literal — recognising keyword binders must not turn every
+/// keyword-led bracket into a comprehension.
+///
+/// Unit: `parse()` / AST `Literal::List`
+/// Precondition: `MATCH (n) RETURN [key, type, count];` (three variables).
+/// Expectation: `Literal::List` with three `Variable` elements.
+#[test]
+fn test_list_literal_of_keyword_named_variables_unaffected() {
+    use decypher::ast::expr::{Expression, Literal};
+
+    let query = parse("MATCH (n) RETURN [key, type, count];").unwrap();
+    match first_projection_expr(&query) {
+        Expression::Literal(Literal::List(list)) => {
+            check!(list.elements.len() == 3);
+            check!(matches!(&list.elements[0], Expression::Variable(v) if v.name.name == "key"));
+            check!(matches!(&list.elements[1], Expression::Variable(v) if v.name.name == "type"));
+            check!(matches!(&list.elements[2], Expression::Variable(v) if v.name.name == "count"));
+        }
+        other => panic!("expected a list literal, got {other:?}"),
+    }
+}

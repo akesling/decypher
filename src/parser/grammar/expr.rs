@@ -1255,7 +1255,7 @@ fn parse_bracket_expr(p: &mut Parser) {
     let mut is_pattern_comprehension = false;
 
     if let Some(tok) = first {
-        if tok.kind == SyntaxKind::IDENT || tok.kind == SyntaxKind::ESCAPED_IDENT {
+        if is_name_start_kind(tok.kind) {
             loop {
                 match lx.advance() {
                     Some(t) if t.kind == SyntaxKind::WHITESPACE => continue,
@@ -1298,7 +1298,7 @@ fn parse_bracket_expr(p: &mut Parser) {
         p.bump(); // [
         p.skip_trivia();
         // Optional variable =
-        if p.at(SyntaxKind::IDENT) || p.at(SyntaxKind::ESCAPED_IDENT) {
+        if is_name_start_kind(p.current_kind()) {
             let next = p.peek_next_non_trivia();
             if next == Some(SyntaxKind::EQ) {
                 p.start_node(SyntaxKind::VARIABLE);
@@ -3222,6 +3222,18 @@ fn parse_finish_clause(p: &mut Parser) {
 
 fn is_keyword_as_name(p: &Parser) -> bool {
     is_name_keyword_kind(p.current_kind())
+}
+
+/// Whether a token kind can open a variable name: a plain or escaped
+/// identifier, or a contextual keyword used as a name (`key`, `type`,
+/// `count`, …).
+///
+/// The binder of a list comprehension (`[key IN keys(r) | …]`) and the path
+/// variable of a pattern comprehension (`[key = (a)-->(b) | key]`) are ordinary
+/// variables, so they accept exactly what `parse_filter_expression` and the
+/// pattern parsers accept — not identifiers alone.
+fn is_name_start_kind(kind: SyntaxKind) -> bool {
+    matches!(kind, SyntaxKind::IDENT | SyntaxKind::ESCAPED_IDENT) || is_name_keyword_kind(kind)
 }
 
 /// [`SyntaxKind`]-only variant of [`is_keyword_as_name`], usable against a
