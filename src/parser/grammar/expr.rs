@@ -283,6 +283,7 @@ fn parse_postfix_node_labels(p: &mut Parser) {
             SyntaxKind::NODE_LABEL,
             SyntaxKind::LABEL_NAME,
             SyntaxKind::DYNAMIC_LABEL,
+            ColonAlternatives::No,
         );
         p.builder.finish_node();
         p.skip_trivia();
@@ -290,14 +291,29 @@ fn parse_postfix_node_labels(p: &mut Parser) {
     p.builder.finish_node();
 }
 
+/// Whether an alternative after `|` may repeat the leading `:`.
+///
+/// openCypher spells relationship-type alternation both as `:A|B|C` and,
+/// legacily, as `:A|:B|:C`; the two are the same union of types, so the
+/// repeated colon is punctuation the parser eats and the tree does not
+/// record. Node-label position has no such spelling — there `:A:B` is
+/// label *conjunction*, a different construct — so it is passed
+/// `ColonAlternatives::No` and `|:` stays a syntax error.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColonAlternatives {
+    Yes,
+    No,
+}
+
 fn parse_label_expression(
     p: &mut Parser,
     static_kind: SyntaxKind,
     name_kind: SyntaxKind,
     dynamic_kind: SyntaxKind,
+    colons: ColonAlternatives,
 ) {
     p.start_node(SyntaxKind::LABEL_EXPRESSION);
-    parse_label_or(p, static_kind, name_kind, dynamic_kind);
+    parse_label_or(p, static_kind, name_kind, dynamic_kind, colons);
     p.builder.finish_node();
 }
 
@@ -306,14 +322,22 @@ fn parse_label_or(
     static_kind: SyntaxKind,
     name_kind: SyntaxKind,
     dynamic_kind: SyntaxKind,
+    colons: ColonAlternatives,
 ) {
     p.start_node(SyntaxKind::LABEL_OR);
-    parse_label_and(p, static_kind, name_kind, dynamic_kind);
+    parse_label_and(p, static_kind, name_kind, dynamic_kind, colons);
     p.skip_trivia();
     while p.at(SyntaxKind::PIPE) {
         p.bump();
         p.skip_trivia();
-        parse_label_and(p, static_kind, name_kind, dynamic_kind);
+        if colons == ColonAlternatives::Yes && p.at(SyntaxKind::COLON) {
+            // `:A|:B` — the colon is redundant with the one that opened the
+            // type list. Bump it so the CST stays lossless, then require a
+            // real alternative after it (a trailing `|:` is still an error).
+            p.bump();
+            p.skip_trivia();
+        }
+        parse_label_and(p, static_kind, name_kind, dynamic_kind, colons);
         p.skip_trivia();
     }
     p.builder.finish_node();
@@ -324,14 +348,15 @@ fn parse_label_and(
     static_kind: SyntaxKind,
     name_kind: SyntaxKind,
     dynamic_kind: SyntaxKind,
+    colons: ColonAlternatives,
 ) {
     p.start_node(SyntaxKind::LABEL_AND);
-    parse_label_not(p, static_kind, name_kind, dynamic_kind);
+    parse_label_not(p, static_kind, name_kind, dynamic_kind, colons);
     p.skip_trivia();
     while p.at(SyntaxKind::AMPERSAND) {
         p.bump();
         p.skip_trivia();
-        parse_label_not(p, static_kind, name_kind, dynamic_kind);
+        parse_label_not(p, static_kind, name_kind, dynamic_kind, colons);
         p.skip_trivia();
     }
     p.builder.finish_node();
@@ -342,15 +367,16 @@ fn parse_label_not(
     static_kind: SyntaxKind,
     name_kind: SyntaxKind,
     dynamic_kind: SyntaxKind,
+    colons: ColonAlternatives,
 ) {
     if p.at(SyntaxKind::BANG) {
         p.start_node(SyntaxKind::LABEL_NOT);
         p.bump();
         p.skip_trivia();
-        parse_label_not(p, static_kind, name_kind, dynamic_kind);
+        parse_label_not(p, static_kind, name_kind, dynamic_kind, colons);
         p.builder.finish_node();
     } else {
-        parse_label_primary(p, static_kind, name_kind, dynamic_kind);
+        parse_label_primary(p, static_kind, name_kind, dynamic_kind, colons);
     }
 }
 
@@ -359,12 +385,13 @@ fn parse_label_primary(
     static_kind: SyntaxKind,
     name_kind: SyntaxKind,
     dynamic_kind: SyntaxKind,
+    colons: ColonAlternatives,
 ) {
     if p.at(SyntaxKind::L_PAREN) {
         p.start_node(SyntaxKind::LABEL_PAREN);
         p.bump();
         p.skip_trivia();
-        parse_label_or(p, static_kind, name_kind, dynamic_kind);
+        parse_label_or(p, static_kind, name_kind, dynamic_kind, colons);
         p.skip_trivia();
         p.expect(SyntaxKind::R_PAREN);
         p.builder.finish_node();
@@ -1203,6 +1230,7 @@ fn parse_node_pattern_for_atom(p: &mut Parser) {
             SyntaxKind::NODE_LABEL,
             SyntaxKind::LABEL_NAME,
             SyntaxKind::DYNAMIC_LABEL,
+            ColonAlternatives::No,
         );
         p.builder.finish_node();
         p.skip_trivia();
@@ -2033,6 +2061,7 @@ fn parse_relationship_detail(p: &mut Parser) {
             SyntaxKind::REL_TYPE_NAME,
             SyntaxKind::REL_TYPE_NAME,
             SyntaxKind::DYNAMIC_REL_TYPE,
+            ColonAlternatives::Yes,
         );
         p.builder.finish_node();
     }
@@ -2110,6 +2139,7 @@ fn parse_node_pattern(p: &mut Parser) {
             SyntaxKind::NODE_LABEL,
             SyntaxKind::LABEL_NAME,
             SyntaxKind::DYNAMIC_LABEL,
+            ColonAlternatives::No,
         );
         p.builder.finish_node();
         p.skip_trivia();

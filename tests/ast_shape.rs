@@ -1878,3 +1878,212 @@ fn test_list_literal_of_keyword_named_variables_unaffected() {
         other => panic!("expected a list literal, got {other:?}"),
     }
 }
+
+// ============================================================
+// Relationship-type alternation spelled with repeated colons
+//
+// openCypher accepts relationship-type alternation both as `:A|B|C` and,
+// legacily, as `:A|:B|:C`; the two spellings denote the same union of
+// types. decypher's label-expression parser only ever consumed a single
+// leading `:`, so every alternative after the first had to be bare and
+// `-[:A|:B]->` failed to parse. The repeated colon is now punctuation the
+// relationship-type position tolerates and the AST does not record, so the
+// two spellings (and any mixture of them) produce the same type tree.
+//
+// It stays punctuation only there: on a node, `:A:B` is label
+// *conjunction*, so `(n:A|:B)` remains a syntax error, as does a dangling
+// `:A|:` with no alternative behind it.
+// ============================================================
+
+/// The relationship chains of the first MATCH clause's first pattern part.
+fn first_match_chains(
+    query: &decypher::ast::Query,
+) -> &[decypher::ast::pattern::PatternElementChain] {
+    let QueryBody::SingleQuery(sq) = &query.statements[0] else {
+        panic!("expected SingleQuery");
+    };
+    let decypher::ast::query::SingleQueryKind::SinglePart(spq) = &sq.kind else {
+        panic!("expected SinglePart query");
+    };
+    let decypher::ast::query::ReadingClause::Match(m) = &spq.reading_clauses[0] else {
+        panic!("expected Match clause");
+    };
+    match &m.pattern.parts[0].anonymous.element {
+        decypher::ast::pattern::PatternElement::Path { chains, .. } => chains,
+        other => panic!("expected a Path pattern element, got {other:?}"),
+    }
+}
+
+/// The first relationship's detail in the first MATCH clause.
+fn first_match_rel_detail(
+    query: &decypher::ast::Query,
+) -> &decypher::ast::pattern::RelationshipDetail {
+    first_match_chains(query)[0]
+        .relationship
+        .detail
+        .as_ref()
+        .expect("relationship detail")
+}
+
+/// Render a label expression's structure with explicit parentheses, so two
+/// trees can be compared for shape and names without comparing the spans,
+/// which necessarily differ between two spellings of the same types.
+fn label_shape(expr: &decypher::ast::pattern::LabelExpression) -> String {
+    use decypher::ast::pattern::LabelExpression;
+
+    match expr {
+        LabelExpression::Static(name) => name.name.to_string(),
+        LabelExpression::Or { lhs, rhs, .. } => {
+            format!("({}|{})", label_shape(lhs), label_shape(rhs))
+        }
+        LabelExpression::And { lhs, rhs, .. } => {
+            format!("({}&{})", label_shape(lhs), label_shape(rhs))
+        }
+        LabelExpression::Not { inner, .. } => format!("!{}", label_shape(inner)),
+        LabelExpression::Group { inner, .. } => format!("[{}]", label_shape(inner)),
+        other => panic!("unexpected label expression form: {other:?}"),
+    }
+}
+
+/// The relationship-type tree of the first MATCH clause's first relationship.
+fn first_match_rel_type_shape(query: &decypher::ast::Query) -> String {
+    label_shape(
+        first_match_rel_detail(query)
+            .types
+            .as_ref()
+            .expect("relationship types"),
+    )
+}
+
+/// `-[:A|:B]->` must parse, and to exactly the type tree that `-[:A|B]->`
+/// parses to — the repeated colon is a spelling, not a distinct construct.
+///
+/// Unit: `parse()` / AST `RelationshipDetail::types`
+/// Precondition: `MATCH (a)-[:A|:B]->(b) RETURN b;` and the same query with
+///   `:A|B`.
+/// Expectation: both yield the type tree `(A|B)`.
+#[test]
+fn test_rel_type_repeated_colon_matches_plain_alternation() {
+    let repeated = parse("MATCH (a)-[:A|:B]->(b) RETURN b;").unwrap();
+    let plain = parse("MATCH (a)-[:A|B]->(b) RETURN b;").unwrap();
+    check!(first_match_rel_type_shape(&repeated) == "(A|B)");
+    check!(first_match_rel_type_shape(&repeated) == first_match_rel_type_shape(&plain));
+}
+
+/// The same type repeated — `-[:T|:T]->` — is accepted; alternation does not
+/// require the alternatives to be distinct.
+///
+/// Unit: `parse()` / AST `RelationshipDetail::types`
+/// Precondition: `MATCH (a)-[:T|:T]->(b) RETURN b;`.
+/// Expectation: the type tree is `(T|T)`.
+#[test]
+fn test_rel_type_repeated_colon_same_type_twice() {
+    let query = parse("MATCH (a)-[:T|:T]->(b) RETURN b;").unwrap();
+    check!(first_match_rel_type_shape(&query) == "(T|T)");
+}
+
+/// A three-way alternation may mix the two spellings freely: `:A|B|:C`,
+/// `:A|:B|:C` and `:A|B|C` are all the same left-nested union.
+///
+/// Unit: `parse()` / AST `RelationshipDetail::types`
+/// Precondition: the three spellings of a three-type alternation.
+/// Expectation: every one yields `((A|B)|C)`.
+#[test]
+fn test_rel_type_mixed_colon_spellings_agree() {
+    for query in [
+        "MATCH (a)-[:A|B|:C]->(b) RETURN b;",
+        "MATCH (a)-[:A|:B|:C]->(b) RETURN b;",
+        "MATCH (a)-[:A|B|C]->(b) RETURN b;",
+    ] {
+        let parsed = parse(query).unwrap();
+        check!(
+            first_match_rel_type_shape(&parsed) == "((A|B)|C)",
+            "{query}"
+        );
+    }
+}
+
+/// A bound relationship variable is unaffected by the spelling: `-[r:A|:B]->`
+/// still binds `r` and still carries both types.
+///
+/// Unit: `parse()` / AST `RelationshipDetail::{variable, types}`
+/// Precondition: `MATCH (a)-[r:A|:B]->(b) RETURN r;`.
+/// Expectation: `variable == "r"` and the type tree is `(A|B)`.
+#[test]
+fn test_rel_type_repeated_colon_with_bound_variable() {
+    let query = parse("MATCH (a)-[r:A|:B]->(b) RETURN r;").unwrap();
+    let detail = first_match_rel_detail(&query);
+    check!(detail.variable.as_ref().expect("variable").name.name == "r");
+    check!(first_match_rel_type_shape(&query) == "(A|B)");
+}
+
+/// A variable-length quantifier still follows the type list: the `*` after
+/// `:A|:B` is not swallowed by the alternation.
+///
+/// Unit: `parse()` / AST `RelationshipDetail::{types, range}`
+/// Precondition: `MATCH (a)-[:A|:B*1..3]->(b) RETURN b;`.
+/// Expectation: the type tree is `(A|B)` and `range == Some(1..3)`.
+#[test]
+fn test_rel_type_repeated_colon_with_variable_length() {
+    let query = parse("MATCH (a)-[:A|:B*1..3]->(b) RETURN b;").unwrap();
+    check!(first_match_rel_type_shape(&query) == "(A|B)");
+    let range = first_match_rel_detail(&query)
+        .range
+        .as_ref()
+        .expect("variable-length range");
+    check!(range.start == Some(1));
+    check!(range.end == Some(3));
+}
+
+/// A dangling `|:` with no alternative behind it is still a syntax error —
+/// tolerating the colon must not make the alternative itself optional.
+///
+/// Unit: `parse()`
+/// Precondition: `MATCH (a)-[:A|:]->(b) RETURN b;`.
+/// Expectation: `parse()` returns `Err`.
+#[test]
+fn test_rel_type_dangling_colon_alternative_is_rejected() {
+    let result = parse("MATCH (a)-[:A|:]->(b) RETURN b;");
+    check!(result.is_err());
+}
+
+/// Node-label position does not gain the spelling: `(n:A|:B)` is still a
+/// syntax error, because a second `:` on a node introduces a *conjoined*
+/// label rather than another alternative.
+///
+/// Unit: `parse()`
+/// Precondition: `MATCH (n:A|:B) RETURN n;`.
+/// Expectation: `parse()` returns `Err`.
+#[test]
+fn test_node_label_alternation_rejects_repeated_colon() {
+    let result = parse("MATCH (n:A|:B) RETURN n;");
+    check!(result.is_err());
+}
+
+/// Conjunctive node labels are untouched: `(n:A:B)` still parses as two
+/// separate label expressions on the node.
+///
+/// Unit: `parse()` / AST `NodePattern::labels`
+/// Precondition: `MATCH (n:A:B) RETURN n;`.
+/// Expectation: the node carries the two static labels `A` and `B`.
+#[test]
+fn test_conjunctive_node_labels_unaffected() {
+    let query = parse("MATCH (n:A:B) RETURN n;").unwrap();
+    let QueryBody::SingleQuery(sq) = &query.statements[0] else {
+        panic!("expected SingleQuery");
+    };
+    let decypher::ast::query::SingleQueryKind::SinglePart(spq) = &sq.kind else {
+        panic!("expected SinglePart query");
+    };
+    let decypher::ast::query::ReadingClause::Match(m) = &spq.reading_clauses[0] else {
+        panic!("expected Match clause");
+    };
+    let decypher::ast::pattern::PatternElement::Path { start, .. } =
+        &m.pattern.parts[0].anonymous.element
+    else {
+        panic!("expected a Path pattern element");
+    };
+    check!(start.labels.len() == 2);
+    check!(label_shape(&start.labels[0]) == "A");
+    check!(label_shape(&start.labels[1]) == "B");
+}
