@@ -504,8 +504,12 @@ impl SetItem {
         last
     }
 
-    pub fn node_labels(&self) -> Option<super::patterns::NodeLabels> {
-        child(&self.0)
+    /// Every `NODE_LABELS` group of a label item, in source order.
+    ///
+    /// `SET n:A:B` opens one group per colon, so a label item can carry more
+    /// than one — the same shape node-label position uses.
+    pub fn node_labels(&self) -> AstChildren<super::patterns::NodeLabels> {
+        children(&self.0)
     }
 
     /// Returns the dynamic key expression for `variable[$key]` SET targets.
@@ -630,8 +634,12 @@ impl RemoveItem {
             .and_then(Expression::cast)
     }
 
-    pub fn node_labels(&self) -> Option<super::patterns::NodeLabels> {
-        child(&self.0)
+    /// Every `NODE_LABELS` group of a label item, in source order.
+    ///
+    /// `REMOVE n:A:B` opens one group per colon, so a label item can carry
+    /// more than one — the same shape node-label position uses.
+    pub fn node_labels(&self) -> AstChildren<super::patterns::NodeLabels> {
+        children(&self.0)
     }
 }
 

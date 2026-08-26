@@ -442,33 +442,51 @@ fn build_set(c: SetClause) -> Result<ast_c::Set> {
     })
 }
 
+/// Flattens the `NODE_LABELS` groups of a `SET`/`REMOVE` label item into the
+/// labels they name, in source order.
+///
+/// `n:A:B` opens one group per colon, so the labels of a single item are spread
+/// across every group rather than gathered in the first one.
+fn build_label_item_labels(
+    groups: impl Iterator<Item = NodeLabels>,
+    sp: Span,
+) -> Result<Vec<ast_c::SymbolicName>> {
+    groups
+        .flat_map(|group| group.labels())
+        .map(|l| {
+            l.name()
+                .and_then(|ln| ln.symbolic_name())
+                .map(|s| ast_c::SymbolicName {
+                    name: symbolic_name_text(&s),
+                    span: span_of(s.syntax()),
+                })
+                .ok_or_else(|| internal("missing label name", sp))
+        })
+        .collect()
+}
+
+/// The variable a `SET`/`REMOVE` label item relabels.
+///
+/// Only a variable can carry labels, so the item's target expression is
+/// expected to be one.
+fn label_item_variable(target: Expression, sp: Span) -> Result<ast_c::Variable> {
+    match build_expression(target)? {
+        ast_c::Expression::Variable(v) => Ok(v),
+        _ => Err(internal("label item target is not a variable", sp)),
+    }
+}
+
 fn build_set_item(item: SetItem) -> Result<ast_c::SetItem> {
     let sp = span_of(item.syntax());
 
-    if let Some(labels) = item.node_labels()
-        && let Some(_prop_expr) = item.property_expr()
+    let mut label_groups = item.node_labels().peekable();
+    if label_groups.peek().is_some()
+        && let Some(target) = item.property_expr()
     {
-        let ast_labels: Result<Vec<_>> = labels
-            .labels()
-            .map(|l| {
-                l.name()
-                    .and_then(|ln| ln.symbolic_name())
-                    .map(|s| ast_c::SymbolicName {
-                        name: symbolic_name_text(&s),
-                        span: span_of(s.syntax()),
-                    })
-                    .ok_or_else(|| internal("missing label name", sp))
-            })
-            .collect();
-        let v = ast_c::Variable {
-            name: ast_c::SymbolicName {
-                name: String::new(),
-                span: sp,
-            },
-        };
+        let labels = build_label_item_labels(label_groups, sp)?;
         return Ok(ast_c::SetItem::Labels {
-            variable: v,
-            labels: ast_labels?,
+            variable: label_item_variable(target, sp)?,
+            labels,
         });
     }
 
@@ -534,30 +552,14 @@ fn build_remove(c: RemoveClause) -> Result<ast_c::Remove> {
 
 fn build_remove_item(item: RemoveItem) -> Result<ast_c::RemoveItem> {
     let sp = span_of(item.syntax());
-    if let Some(labels) = item.node_labels()
-        && let Some(_prop_expr) = item.property_expr()
+    let mut label_groups = item.node_labels().peekable();
+    if label_groups.peek().is_some()
+        && let Some(target) = item.property_expr()
     {
-        let ast_labels: Result<Vec<_>> = labels
-            .labels()
-            .map(|l| {
-                l.name()
-                    .and_then(|ln| ln.symbolic_name())
-                    .map(|s| ast_c::SymbolicName {
-                        name: symbolic_name_text(&s),
-                        span: span_of(s.syntax()),
-                    })
-                    .ok_or_else(|| internal("missing label name", sp))
-            })
-            .collect();
-        let v = ast_c::Variable {
-            name: ast_c::SymbolicName {
-                name: String::new(),
-                span: sp,
-            },
-        };
+        let labels = build_label_item_labels(label_groups, sp)?;
         return Ok(ast_c::RemoveItem::Labels {
-            variable: v,
-            labels: ast_labels?,
+            variable: label_item_variable(target, sp)?,
+            labels,
         });
     }
     let prop = item

@@ -2087,3 +2087,226 @@ fn test_conjunctive_node_labels_unaffected() {
     check!(label_shape(&start.labels[0]) == "A");
     check!(label_shape(&start.labels[1]) == "B");
 }
+
+// ============================================================
+// Label items in SET and REMOVE
+//
+// `SET n:A` and `REMOVE n:A` relabel a node, and openCypher lets a single
+// item name several labels at once — `n:A:B` adds (or removes) both. The
+// two clauses parsed that spelling differently: SET accepted the repeated
+// colon while REMOVE stopped after the first label, so `REMOVE n:A:B` was
+// a syntax error at the second `:`. Both clauses now share one label-list
+// rule, and the AST records what it parses: the item's target variable by
+// name, and every label of the item in source order rather than only those
+// of the first `:` group.
+//
+// The colon is still not optional: a trailing `SET n:` / `REMOVE n:` names
+// no label and is a syntax error in both clauses.
+// ============================================================
+
+/// The updating clauses of the first statement's single-part body.
+fn first_updating_clauses(query: &decypher::ast::Query) -> &[decypher::ast::query::UpdatingClause] {
+    let QueryBody::SingleQuery(sq) = &query.statements[0] else {
+        panic!("expected SingleQuery");
+    };
+    let decypher::ast::query::SingleQueryKind::SinglePart(spq) = &sq.kind else {
+        panic!("expected SinglePart query");
+    };
+    match &spq.body {
+        SinglePartBody::Updating { updating, .. } => updating,
+        other => panic!("expected an Updating body, got {other:?}"),
+    }
+}
+
+/// The target variable and labels of the first `SET` clause's first item.
+fn first_set_label_item(query: &decypher::ast::Query) -> (String, Vec<String>) {
+    let decypher::ast::query::UpdatingClause::Set(set) = &first_updating_clauses(query)[0] else {
+        panic!("expected a SET clause");
+    };
+    let decypher::ast::clause::SetItem::Labels { variable, labels } = &set.items[0] else {
+        panic!("expected a label SET item, got {:?}", set.items[0]);
+    };
+    (
+        variable.name.name.to_string(),
+        labels.iter().map(|l| l.name.to_string()).collect(),
+    )
+}
+
+/// The target variable and labels of the first `REMOVE` clause's first item.
+fn first_remove_label_item(query: &decypher::ast::Query) -> (String, Vec<String>) {
+    let decypher::ast::query::UpdatingClause::Remove(remove) = &first_updating_clauses(query)[0]
+    else {
+        panic!("expected a REMOVE clause");
+    };
+    let decypher::ast::clause::RemoveItem::Labels { variable, labels } = &remove.items[0] else {
+        panic!("expected a label REMOVE item, got {:?}", remove.items[0]);
+    };
+    (
+        variable.name.name.to_string(),
+        labels.iter().map(|l| l.name.to_string()).collect(),
+    )
+}
+
+/// A single-label `SET n:A` records the target variable by name, not just by
+/// span, so a consumer never has to re-read the source to learn it.
+///
+/// Unit: `parse()` / AST `SetItem::Labels`
+/// Precondition: `MATCH (n) SET n:A RETURN n;`.
+/// Expectation: the item names variable `n` and the single label `A`, and the
+///   variable's span covers exactly the `n` that precedes the colon.
+#[test]
+fn test_set_single_label_names_variable() {
+    let query = parse("MATCH (n) SET n:A RETURN n;").unwrap();
+    let (variable, labels) = first_set_label_item(&query);
+    check!(variable == "n");
+    check!(labels == ["A"]);
+
+    let decypher::ast::query::UpdatingClause::Set(set) = &first_updating_clauses(&query)[0] else {
+        panic!("expected a SET clause");
+    };
+    let decypher::ast::clause::SetItem::Labels { variable, .. } = &set.items[0] else {
+        panic!("expected a label SET item");
+    };
+    check!(&"MATCH (n) SET n:A RETURN n;"[variable.name.span.start..variable.name.span.end] == "n");
+}
+
+/// A single-label `REMOVE n:A` records the target variable the same way.
+///
+/// Unit: `parse()` / AST `RemoveItem::Labels`
+/// Precondition: `MATCH (n) REMOVE n:A RETURN n;`.
+/// Expectation: the item names variable `n` and the single label `A`, and the
+///   variable's span covers exactly the `n` that precedes the colon.
+#[test]
+fn test_remove_single_label_names_variable() {
+    let query = parse("MATCH (n) REMOVE n:A RETURN n;").unwrap();
+    let (variable, labels) = first_remove_label_item(&query);
+    check!(variable == "n");
+    check!(labels == ["A"]);
+
+    let decypher::ast::query::UpdatingClause::Remove(remove) = &first_updating_clauses(&query)[0]
+    else {
+        panic!("expected a REMOVE clause");
+    };
+    let decypher::ast::clause::RemoveItem::Labels { variable, .. } = &remove.items[0] else {
+        panic!("expected a label REMOVE item");
+    };
+    check!(
+        &"MATCH (n) REMOVE n:A RETURN n;"[variable.name.span.start..variable.name.span.end] == "n"
+    );
+}
+
+/// `SET n:A:B` adds both labels, and both reach the AST in source order.
+///
+/// Unit: `parse()` / AST `SetItem::Labels`
+/// Precondition: `MATCH (n) SET n:A:B RETURN n;`.
+/// Expectation: the item names variable `n` and the labels `A` and `B`.
+#[test]
+fn test_set_two_labels() {
+    let query = parse("MATCH (n) SET n:A:B RETURN n;").unwrap();
+    let (variable, labels) = first_set_label_item(&query);
+    check!(variable == "n");
+    check!(labels == ["A", "B"]);
+}
+
+/// `REMOVE n:A:B` removes both labels — the second `:` is part of the item,
+/// not the start of a new clause.
+///
+/// Unit: `parse()` / AST `RemoveItem::Labels`
+/// Precondition: `MATCH (n) REMOVE n:A:B RETURN n;`.
+/// Expectation: the item names variable `n` and the labels `A` and `B`.
+#[test]
+fn test_remove_two_labels() {
+    let query = parse("MATCH (n) REMOVE n:A:B RETURN n;").unwrap();
+    let (variable, labels) = first_remove_label_item(&query);
+    check!(variable == "n");
+    check!(labels == ["A", "B"]);
+}
+
+/// The label list has no fixed length: three labels are reported as three.
+///
+/// Unit: `parse()` / AST `SetItem::Labels` and `RemoveItem::Labels`
+/// Precondition: `MATCH (n) SET n:A:B:C RETURN n;` and the `REMOVE` twin.
+/// Expectation: both items carry `A`, `B` and `C`.
+#[test]
+fn test_three_labels_in_both_clauses() {
+    let set = parse("MATCH (n) SET n:A:B:C RETURN n;").unwrap();
+    check!(first_set_label_item(&set) == ("n".to_string(), vec_of(["A", "B", "C"])));
+
+    let remove = parse("MATCH (n) REMOVE n:A:B:C RETURN n;").unwrap();
+    check!(first_remove_label_item(&remove) == ("n".to_string(), vec_of(["A", "B", "C"])));
+}
+
+/// Owned `String`s for comparing against a reported label list.
+fn vec_of<const N: usize>(names: [&str; N]) -> Vec<String> {
+    names.iter().map(|n| n.to_string()).collect()
+}
+
+/// The TCK's `Remove3` scenario — removing two of a node's three labels —
+/// parses, and the two labels named are the two reported.
+///
+/// Unit: `parse()` / AST `RemoveItem::Labels`
+/// Precondition: `MATCH (n) REMOVE n:L1:L3 RETURN labels(n);`.
+/// Expectation: the item names variable `n` and the labels `L1` and `L3`.
+#[test]
+fn test_remove_two_of_three_labels() {
+    let query = parse("MATCH (n) REMOVE n:L1:L3 RETURN labels(n);").unwrap();
+    let (variable, labels) = first_remove_label_item(&query);
+    check!(variable == "n");
+    check!(labels == ["L1", "L3"]);
+}
+
+/// A `:` that names no label is a truncated item, not an item with zero
+/// labels: a dangling colon is a syntax error in both clauses.
+///
+/// Unit: `parse()`
+/// Precondition: `MATCH (n) SET n:;` and `MATCH (n) REMOVE n:;`, plus the
+///   same two items followed by a further clause.
+/// Expectation: `parse()` returns `Err` for every one.
+#[test]
+fn test_dangling_label_colon_is_rejected() {
+    for query in [
+        "MATCH (n) SET n:;",
+        "MATCH (n) REMOVE n:;",
+        "MATCH (n) SET n: RETURN n;",
+        "MATCH (n) REMOVE n: RETURN n;",
+    ] {
+        check!(parse(query).is_err(), "{query}");
+    }
+}
+
+/// Sharing a label-list rule between the two clauses leaves node-pattern
+/// label position alone: `(n:A:B)` is still a conjunction of two label
+/// expressions on the node, and `:A|:B` is still relationship alternation.
+///
+/// Unit: `parse()` / AST `NodePattern::labels` and `RelationshipDetail::types`
+/// Precondition: `MATCH (n:A:B) REMOVE n:A:B RETURN n;` and
+///   `MATCH (a)-[:A|:B]->(b) SET b:C:D RETURN b;`.
+/// Expectation: the node carries the label expressions `A` and `B`, the
+///   relationship carries the type tree `(A|B)`, and each label item carries
+///   both of its labels.
+#[test]
+fn test_label_items_leave_pattern_labels_alone() {
+    let query = parse("MATCH (n:A:B) REMOVE n:A:B RETURN n;").unwrap();
+    let QueryBody::SingleQuery(sq) = &query.statements[0] else {
+        panic!("expected SingleQuery");
+    };
+    let decypher::ast::query::SingleQueryKind::SinglePart(spq) = &sq.kind else {
+        panic!("expected SinglePart query");
+    };
+    let decypher::ast::query::ReadingClause::Match(m) = &spq.reading_clauses[0] else {
+        panic!("expected Match clause");
+    };
+    let decypher::ast::pattern::PatternElement::Path { start, .. } =
+        &m.pattern.parts[0].anonymous.element
+    else {
+        panic!("expected a Path pattern element");
+    };
+    check!(start.labels.len() == 2);
+    check!(label_shape(&start.labels[0]) == "A");
+    check!(label_shape(&start.labels[1]) == "B");
+    check!(first_remove_label_item(&query) == ("n".to_string(), vec_of(["A", "B"])));
+
+    let alternation = parse("MATCH (a)-[:A|:B]->(b) SET b:C:D RETURN b;").unwrap();
+    check!(first_match_rel_type_shape(&alternation) == "(A|B)");
+    check!(first_set_label_item(&alternation) == ("b".to_string(), vec_of(["C", "D"])));
+}

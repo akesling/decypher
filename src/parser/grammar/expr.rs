@@ -1758,6 +1758,38 @@ fn parse_set_clause(p: &mut Parser) {
     p.builder.finish_node();
 }
 
+/// Parses the label list of a `SET`/`REMOVE` label item: `:Label` repeated,
+/// as in `SET n:A:B` / `REMOVE n:A:B`.
+///
+/// Labels here are *conjunctive* — every one of them is added to (or removed
+/// from) the target — so, exactly as in node-label position, each `:` opens its
+/// own `NODE_LABELS` node and neither `|` alternation nor the `$(…)` dynamic
+/// form is part of the spelling. A `:` with no label name after it is an error:
+/// a trailing colon is a truncated item, not an item with zero labels.
+fn parse_label_item_labels(p: &mut Parser) {
+    while p.at(SyntaxKind::COLON) {
+        p.start_node(SyntaxKind::NODE_LABELS);
+        p.bump();
+        p.skip_trivia();
+        if p.at(SyntaxKind::IDENT)
+            || p.at(SyntaxKind::ESCAPED_IDENT)
+            || (is_keyword_as_name(p) && !p.at(SyntaxKind::KW_WHERE))
+        {
+            p.start_node(SyntaxKind::NODE_LABEL);
+            p.start_node(SyntaxKind::LABEL_NAME);
+            p.start_node(SyntaxKind::SYMBOLIC_NAME);
+            p.bump();
+            p.builder.finish_node();
+            p.builder.finish_node();
+            p.builder.finish_node();
+        } else {
+            p.expect_one_of(&[Expected::Category(Cow::Borrowed("label name"))]);
+        }
+        p.builder.finish_node();
+        p.skip_trivia();
+    }
+}
+
 fn parse_set_item(p: &mut Parser) {
     p.start_node(SyntaxKind::SET_ITEM);
     if p.at(SyntaxKind::L_PAREN) {
@@ -1810,22 +1842,7 @@ fn parse_set_item(p: &mut Parser) {
         p.skip_trivia();
         expr_bp(p, Prec::MIN);
     } else if p.at(SyntaxKind::COLON) {
-        while p.at(SyntaxKind::COLON) {
-            p.start_node(SyntaxKind::NODE_LABELS);
-            p.bump();
-            p.skip_trivia();
-            if p.at(SyntaxKind::IDENT) || p.at(SyntaxKind::ESCAPED_IDENT) || is_keyword_as_name(p) {
-                p.start_node(SyntaxKind::NODE_LABEL);
-                p.start_node(SyntaxKind::LABEL_NAME);
-                p.start_node(SyntaxKind::SYMBOLIC_NAME);
-                p.bump();
-                p.builder.finish_node();
-                p.builder.finish_node();
-                p.builder.finish_node();
-            }
-            p.builder.finish_node();
-            p.skip_trivia();
-        }
+        parse_label_item_labels(p);
     }
     p.builder.finish_node();
 }
@@ -1851,21 +1868,7 @@ fn parse_remove_item(p: &mut Parser) {
         p.builder.finish_node();
         p.builder.finish_node();
         p.skip_trivia();
-        if p.at(SyntaxKind::COLON) {
-            p.start_node(SyntaxKind::NODE_LABELS);
-            p.bump();
-            p.skip_trivia();
-            if p.at(SyntaxKind::IDENT) {
-                p.start_node(SyntaxKind::NODE_LABEL);
-                p.start_node(SyntaxKind::LABEL_NAME);
-                p.start_node(SyntaxKind::SYMBOLIC_NAME);
-                p.bump();
-                p.builder.finish_node();
-                p.builder.finish_node();
-                p.builder.finish_node();
-            }
-            p.builder.finish_node();
-        }
+        parse_label_item_labels(p);
         while p.at(SyntaxKind::DOT) {
             p.start_node(SyntaxKind::PROPERTY_LOOKUP);
             p.bump();
