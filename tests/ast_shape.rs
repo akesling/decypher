@@ -2310,3 +2310,227 @@ fn test_label_items_leave_pattern_labels_alone() {
     check!(first_match_rel_type_shape(&alternation) == "(A|B)");
     check!(first_set_label_item(&alternation) == ("b".to_string(), vec_of(["C", "D"])));
 }
+
+// ── `CALL … YIELD … WHERE` predicates ───────────────────────────────────
+//
+// The YIELD grammar rule emitted the predicate's tokens straight into
+// `YIELD_ITEMS`, without the `WHERE_CLAUSE` wrapper every other WHERE
+// position uses. The Pratt parser lays a predicate out flat — operands and
+// operator nodes as siblings — so the typed AST could not tell the
+// predicate's root from its leading operand and read back only the latter:
+// `YIELD label WHERE label <> 'B'` yielded `where_clause: Variable("label")`,
+// a filter on a string's truthiness rather than the comparison.
+
+/// The `WHERE` predicate of the first reading clause's `CALL … YIELD …`.
+fn call_yield_where_clause(query: &decypher::ast::Query) -> &decypher::ast::expr::Expression {
+    let QueryBody::SingleQuery(sq) = &query.statements[0] else {
+        panic!("expected SingleQuery");
+    };
+    let decypher::ast::query::SingleQueryKind::SinglePart(spq) = &sq.kind else {
+        panic!("expected SinglePart query");
+    };
+    let decypher::ast::query::ReadingClause::InQueryCall(c) = &spq.reading_clauses[0] else {
+        panic!("expected InQueryCall clause");
+    };
+    c.yield_items
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected YIELD items"))
+        .where_clause
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected a WHERE clause"))
+}
+
+/// `CALL … YIELD label WHERE label <> 'B'` must keep the whole comparison,
+/// not just its left operand.
+///
+/// Unit: `parse()` / AST `YieldItems::where_clause`
+/// Precondition: `CALL test.labels() YIELD label WHERE label <> 'B' RETURN label`.
+/// Expectation: `where_clause` is a `<>` comparison whose left operand is
+/// the variable `label`; the CST stays lossless.
+#[test]
+fn test_yield_where_keeps_comparison() {
+    use decypher::ast::expr::{ComparisonOperator, Expression};
+
+    let source = "CALL test.labels() YIELD label WHERE label <> 'B' RETURN label";
+    let parse_result = decypher::cst::parse(source);
+    check!(parse_result.tree.text().to_string() == source);
+    check!(parse_result.errors.is_empty());
+
+    let query = parse(source).unwrap();
+    match call_yield_where_clause(&query) {
+        Expression::Comparison { lhs, operators, .. } => {
+            check!(operators.len() == 1);
+            check!(operators[0].0 == ComparisonOperator::Ne);
+            match lhs.as_ref() {
+                Expression::Variable(v) => {
+                    check!(v.name.name == "label");
+                }
+                other => panic!("expected Variable lhs, got {other:?}"),
+            }
+        }
+        other => panic!("expected a comparison in WHERE, got {other:?}"),
+    }
+}
+
+/// A boolean combination in a `YIELD … WHERE` keeps its top-level operator:
+/// `AND`/`OR`/`NOT` bind the whole predicate, not the first operand.
+///
+/// Unit: `parse()` / AST `YieldItems::where_clause`
+/// Precondition: `CALL test.proc() YIELD a, b WHERE a <> 'B' AND NOT b IS NULL RETURN a`.
+/// Expectation: `where_clause` is `BinaryOp { op: And, .. }` whose left side
+/// is the `<>` comparison and whose right side is a `NOT`.
+#[test]
+fn test_yield_where_keeps_boolean_combination() {
+    use decypher::ast::expr::{BinaryOperator, Expression, UnaryOperator};
+
+    let query =
+        parse("CALL test.proc() YIELD a, b WHERE a <> 'B' AND NOT b IS NULL RETURN a").unwrap();
+    match call_yield_where_clause(&query) {
+        Expression::BinaryOp { op, lhs, rhs, .. } => {
+            check!(*op == BinaryOperator::And);
+            check!(matches!(lhs.as_ref(), Expression::Comparison { .. }));
+            match rhs.as_ref() {
+                Expression::UnaryOp { op, operand, .. } => {
+                    check!(*op == UnaryOperator::Not);
+                    check!(matches!(operand.as_ref(), Expression::IsNull { .. }));
+                }
+                other => panic!("expected a NOT on the right, got {other:?}"),
+            }
+        }
+        other => panic!("expected Expression::BinaryOp, got {other:?}"),
+    }
+}
+
+/// `IN` in a `YIELD … WHERE` keeps both operands.
+///
+/// Unit: `parse()` / AST `YieldItems::where_clause`
+/// Precondition: `CALL test.labels() YIELD label WHERE label IN ['A', 'B'] RETURN label`.
+/// Expectation: `where_clause` is `In { lhs: Variable("label"), rhs: List(2) }`.
+#[test]
+fn test_yield_where_keeps_in_predicate() {
+    use decypher::ast::expr::{Expression, Literal};
+
+    let query =
+        parse("CALL test.labels() YIELD label WHERE label IN ['A', 'B'] RETURN label").unwrap();
+    match call_yield_where_clause(&query) {
+        Expression::In { lhs, rhs, .. } => {
+            match lhs.as_ref() {
+                Expression::Variable(v) => {
+                    check!(v.name.name == "label");
+                }
+                other => panic!("expected Variable lhs, got {other:?}"),
+            }
+            match rhs.as_ref() {
+                Expression::Literal(Literal::List(list)) => {
+                    check!(list.elements.len() == 2);
+                }
+                other => panic!("expected a list rhs, got {other:?}"),
+            }
+        }
+        other => panic!("expected Expression::In, got {other:?}"),
+    }
+}
+
+/// A parenthesised sub-expression in a `YIELD … WHERE` keeps its grouping:
+/// the `OR` inside the parentheses stays under the outer `AND`.
+///
+/// Unit: `parse()` / AST `YieldItems::where_clause`
+/// Precondition: `CALL test.labels() YIELD label WHERE (label = 'A' OR label = 'B') AND label <> 'C' RETURN label`.
+/// Expectation: `where_clause` is `BinaryOp { op: And, .. }` whose left side
+/// is a `Parenthesized` wrapping the `OR`.
+#[test]
+fn test_yield_where_keeps_parenthesised_predicate() {
+    use decypher::ast::expr::{BinaryOperator, Expression};
+
+    let query = parse(
+        "CALL test.labels() YIELD label WHERE (label = 'A' OR label = 'B') AND label <> 'C' RETURN label",
+    )
+    .unwrap();
+    match call_yield_where_clause(&query) {
+        Expression::BinaryOp { op, lhs, rhs, .. } => {
+            check!(*op == BinaryOperator::And);
+            match lhs.as_ref() {
+                Expression::Parenthesized(inner) => match inner.as_ref() {
+                    Expression::BinaryOp { op, .. } => {
+                        check!(*op == BinaryOperator::Or);
+                    }
+                    other => panic!("expected an OR inside the parentheses, got {other:?}"),
+                },
+                other => panic!("expected a parenthesised group on the left, got {other:?}"),
+            }
+            check!(matches!(rhs.as_ref(), Expression::Comparison { .. }));
+        }
+        other => panic!("expected Expression::BinaryOp, got {other:?}"),
+    }
+}
+
+/// A function call inside a `YIELD … WHERE` is the predicate's left operand,
+/// with the string operator applied to it.
+///
+/// Unit: `parse()` / AST `YieldItems::where_clause`
+/// Precondition: `CALL test.labels() YIELD label WHERE toUpper(label) STARTS WITH 'B' RETURN label`.
+/// Expectation: `where_clause` is a `STARTS WITH` comparison whose left
+/// operand is the `toUpper` call with its one argument.
+#[test]
+fn test_yield_where_keeps_function_call_predicate() {
+    use decypher::ast::expr::{ComparisonOperator, Expression};
+
+    let query =
+        parse("CALL test.labels() YIELD label WHERE toUpper(label) STARTS WITH 'B' RETURN label")
+            .unwrap();
+    match call_yield_where_clause(&query) {
+        Expression::Comparison { lhs, operators, .. } => {
+            check!(operators.len() == 1);
+            check!(operators[0].0 == ComparisonOperator::StartsWith);
+            match lhs.as_ref() {
+                Expression::FunctionCall(fi) => {
+                    let names: Vec<_> = fi.name.iter().map(|s| s.name.as_str()).collect();
+                    check!(names == ["toUpper"]);
+                    check!(fi.arguments.len() == 1);
+                }
+                other => panic!("expected a FunctionCall lhs, got {other:?}"),
+            }
+        }
+        other => panic!("expected a comparison in WHERE, got {other:?}"),
+    }
+}
+
+/// A `YIELD … WHERE` with no predicate after it is a syntax error, in both
+/// the in-query and standalone positions and in `SHOW … YIELD`.
+///
+/// Unit: `parse()` error path
+/// Precondition: `CALL test.labels() YIELD label WHERE` and friends.
+/// Expectation: `parse()` returns `Err` for every one.
+#[test]
+fn test_dangling_yield_where_is_rejected() {
+    for query in [
+        "CALL test.labels() YIELD label WHERE",
+        "CALL test.labels() YIELD label WHERE RETURN label",
+        "MATCH (n) CALL test.proc() YIELD a WHERE RETURN a",
+        "SHOW INDEXES YIELD name WHERE",
+    ] {
+        check!(parse(query).is_err(), "{query}");
+    }
+}
+
+/// The `YIELD … WHERE` predicate survives serialisation: `ToCypher` emits the
+/// whole comparison, and the emitted text re-parses to the same AST. The
+/// predicate also passes semantic analysis unflagged.
+///
+/// Unit: `ToCypher::display` / `parse` / `analyze`
+/// Precondition: `CALL test.labels() YIELD label WHERE label <> 'B' RETURN label;`.
+/// Expectation: `display()` reproduces the query, the re-parsed AST equals the
+/// original, and `analyze` reports nothing on the standalone form.
+#[test]
+fn test_yield_where_round_trips() {
+    use decypher::ast::ToCypher;
+
+    let source = "CALL test.labels() YIELD label WHERE label <> 'B' RETURN label;";
+    let query = parse(source).unwrap();
+    let emitted = query.display().to_string();
+    check!(emitted == source, "emitted: {emitted}");
+    let reparsed = parse(&emitted).unwrap();
+    check!(query == reparsed);
+
+    check!(decypher::analyze("CALL test.labels() YIELD label AS l WHERE l <> 'B'").is_ok());
+}

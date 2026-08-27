@@ -2447,11 +2447,17 @@ fn parse_yield_items(p: &mut Parser) {
         }
     }
     p.skip_trivia();
-    // Optional WHERE
+    // Optional WHERE — wrapped in a WHERE_CLAUSE node so the whole predicate
+    // stays one subtree. The Pratt parser emits a flat chain (operands and
+    // operator nodes as siblings), so without the wrapper the predicate's
+    // leading operand is indistinguishable from its root and the typed AST
+    // reads back only that operand.
     if p.at(SyntaxKind::KW_WHERE) {
+        p.start_node(SyntaxKind::WHERE_CLAUSE);
         p.bump();
         p.skip_trivia();
         expr_bp(p, Prec::MIN);
+        p.builder.finish_node();
         p.skip_trivia();
     }
     p.builder.finish_node();
@@ -3184,11 +3190,13 @@ fn parse_show_yield(p: &mut Parser) {
         }
     }
     p.skip_trivia();
-    // Optional WHERE
+    // Optional WHERE — wrapped in a WHERE_CLAUSE node, as in `parse_yield_items`.
     if p.at(SyntaxKind::KW_WHERE) {
+        p.start_node(SyntaxKind::WHERE_CLAUSE);
         p.bump();
         p.skip_trivia();
         expr_bp(p, Prec::MIN);
+        p.builder.finish_node();
     }
     p.builder.finish_node();
 }

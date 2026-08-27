@@ -841,12 +841,14 @@ impl YieldItems {
         children(&self.0)
     }
 
+    /// The `YIELD … WHERE` predicate, as a whole.
+    ///
+    /// Delegates to the `WHERE_CLAUSE` child so the Pratt parser's flat
+    /// operand chain is resolved by the same rule every other `WHERE`
+    /// position uses — taking the first expression node after the `WHERE`
+    /// token instead yields only the predicate's leading operand.
     pub fn where_expr(&self) -> Option<Expression> {
-        self.0
-            .children_with_tokens()
-            .skip_while(|el| !matches!(el.as_token().map(|t| t.kind()), Some(SyntaxKind::KW_WHERE)))
-            .filter_map(|el| el.into_node())
-            .find_map(Expression::cast)
+        child::<WhereClause>(&self.0).and_then(|w| w.expr())
     }
 }
 
@@ -1086,12 +1088,14 @@ impl ShowReturn {
         children(&self.0)
     }
 
+    /// The `SHOW … YIELD … WHERE` predicate, as a whole.
+    ///
+    /// Delegates to the `WHERE_CLAUSE` child so the Pratt parser's flat
+    /// operand chain is resolved by the same rule every other `WHERE`
+    /// position uses — taking the first expression node after the `WHERE`
+    /// token instead yields only the predicate's leading operand.
     pub fn where_expr(&self) -> Option<Expression> {
-        self.0
-            .children_with_tokens()
-            .skip_while(|el| !matches!(el.as_token().map(|t| t.kind()), Some(SyntaxKind::KW_WHERE)))
-            .filter_map(|el| el.into_node())
-            .find_map(Expression::cast)
+        child::<WhereClause>(&self.0).and_then(|w| w.expr())
     }
 }
 
